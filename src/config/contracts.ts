@@ -215,6 +215,36 @@ export const morphoAbi = [
   },
 ] as const
 
+// Liquidate function
+export const liquidateAbi = [
+  {
+    inputs: [
+      {
+        components: [
+          { name: 'loanToken', type: 'address' },
+          { name: 'collateralToken', type: 'address' },
+          { name: 'oracle', type: 'address' },
+          { name: 'irm', type: 'address' },
+          { name: 'lltv', type: 'uint256' }
+        ],
+        name: 'marketParams',
+        type: 'tuple'
+      },
+      { name: 'borrower', type: 'address' },
+      { name: 'seizedAssets', type: 'uint256' },
+      { name: 'repaidShares', type: 'uint256' },
+      { name: 'data', type: 'bytes' }
+    ],
+    name: 'liquidate',
+    outputs: [
+      { name: 'seizedAssets', type: 'uint256' },
+      { name: 'repaidAssets', type: 'uint256' }
+    ],
+    stateMutability: 'nonpayable',
+    type: 'function'
+  },
+] as const
+
 export const oracleAbi = [
   {
     inputs: [],

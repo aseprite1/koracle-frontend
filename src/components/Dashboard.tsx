@@ -1,7 +1,7 @@
-import { useState, useEffect, useRef } from 'react'
-import { useAccount, useReadContract, useWriteContract, useWaitForTransactionReceipt } from 'wagmi'
+import { useState, useEffect, useRef, useCallback } from 'react'
+import { useAccount, useReadContract, useWriteContract, useWaitForTransactionReceipt, usePublicClient } from 'wagmi'
 import { formatUnits, parseUnits } from 'viem'
-import { ADDRESSES, MARKET_ID, morphoAbi, oracleAbi, erc20Abi, marketParams } from '../config/contracts'
+import { ADDRESSES, MARKET_ID, morphoAbi, oracleAbi, erc20Abi, marketParams, liquidateAbi } from '../config/contracts'
 import { giwaSepoliaNetwork } from '../config/appkit'
 
 // ============ TYPES ============
@@ -19,6 +19,16 @@ interface UserPosition {
   borrowAssets: number
 }
 
+interface LiquidatablePosition {
+  borrower: `0x${string}`
+  collateral: bigint
+  borrowShares: bigint
+  borrowAssets: number
+  healthFactor: number
+  maxSeizable: bigint
+  liquidationIncentive: number
+}
+
 // ============ CONSTANTS ============
 const ORACLE_PRICE_SCALE = 10n ** 36n
 const WAD = 10n ** 18n
@@ -26,10 +36,21 @@ const WAD = 10n ** 18n
 // ============ UTILS ============
 const fmt = (n: number) => new Intl.NumberFormat('en-US').format(n)
 
+// Compact number formatting for large values
+const fmtCompact = (n: number): string => {
+  if (n >= 1e12) return (n / 1e12).toFixed(1) + 'T'
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B'
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M'
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K'
+  if (n >= 100) return n.toFixed(0)
+  if (n >= 1) return n.toFixed(2)
+  return n.toFixed(4)
+}
+
 // ============ MAIN COMPONENT ============
 export default function Dashboard() {
   const { address, isConnected } = useAccount()
-  
+
   // === Local State ===
   const [currentView, setCurrentView] = useState<ViewType>('dashboard')
   const [selection, setSelection] = useState<MarketSelection>(null)
@@ -39,7 +60,7 @@ export default function Dashboard() {
   const [simulatedHF, setSimulatedHF] = useState<number | null>(null)
   const [executionStatus, setExecutionStatus] = useState<'idle' | 'broadcasting' | 'confirmed'>('idle')
   const [txStep, setTxStep] = useState<TxStep>('idle')
-  
+
   const approvedCollateralRef = useRef<bigint>(0n)
   const borrowAmountRef = useRef<bigint>(0n)
 
@@ -57,9 +78,24 @@ export default function Dashboard() {
     supplyAssets: 0,
     borrowAssets: 0
   })
+  const [currentHF, setCurrentHF] = useState<number | null>(null)
+
+  // Liquidation State
+  const [liquidatablePositions, setLiquidatablePositions] = useState<LiquidatablePosition[]>([])
+  const [borrowerToCheck, setBorrowerToCheck] = useState('')
+  const [isLoadingPositions, setIsLoadingPositions] = useState(false)
+  const [selectedBorrower, setSelectedBorrower] = useState<LiquidatablePosition | null>(null)
+  const [liquidateAmount, setLiquidateAmount] = useState('')
+  const [liquidateTxStep, setLiquidateTxStep] = useState<'idle' | 'approving' | 'liquidating'>('idle')
+
+  // Error State (replaces alert())
+  const [errorMessage, setErrorMessage] = useState<string | null>(null)
+
+  // Public client for reading positions
+  const publicClient = usePublicClient({ chainId: giwaSepoliaNetwork.id })
 
   // === Contract Reads ===
-  const { data: marketData } = useReadContract({
+  const { data: marketData, refetch: refetchMarket } = useReadContract({
     address: ADDRESSES.MORPHO,
     abi: morphoAbi,
     functionName: 'market',
@@ -112,7 +148,7 @@ export default function Dashboard() {
   })
 
   // === Effects ===
-  
+
   // Oracle price calculation
   // oraclePrice = (1 UPKRW in UPETH) * 1e36
   // So: 1 ETH in KRW = 1e36 / oraclePrice
@@ -154,22 +190,29 @@ export default function Dashboard() {
         resetWrite()
       } else if (txStep === 'borrowing' || txStep === 'executing') {
         setExecutionStatus('confirmed')
-        refetchPosition()
-        refetchUpethBalance()
-        refetchUpkrwBalance()
-        setTimeout(() => {
-          setExecutionStatus('idle')
-          setTxStep('idle')
-          setInputAmount('')
-          setCollateralAmount('')
-          setSimulatedHF(null)
-          approvedCollateralRef.current = 0n
-          borrowAmountRef.current = 0n
-          resetWrite()
-        }, 2000)
+        
+        // Immediately refetch all data including market data
+        Promise.all([
+          refetchPosition(),
+          refetchUpethBalance(),
+          refetchUpkrwBalance(),
+          refetchMarket()
+        ]).then(() => {
+          // Only reset UI after data is fresh
+          setTimeout(() => {
+            setExecutionStatus('idle')
+            setTxStep('idle')
+            setInputAmount('')
+            setCollateralAmount('')
+            setSimulatedHF(null)
+            approvedCollateralRef.current = 0n
+            borrowAmountRef.current = 0n
+            resetWrite()
+          }, 1500)
+        })
       }
     }
-  }, [isTxSuccess, txStep, refetchPosition, refetchUpethBalance, refetchUpkrwBalance, resetWrite])
+  }, [isTxSuccess, txStep, refetchPosition, refetchUpethBalance, refetchUpkrwBalance, refetchMarket, resetWrite])
 
   useEffect(() => {
     if (positionData && marketData) {
@@ -178,17 +221,17 @@ export default function Dashboard() {
       const totalSupplyShares = marketData[1]
       const totalBorrowAssets = marketData[2]
       const totalBorrowShares = marketData[3]
-      
+
       let supplyAssets = 0
       let borrowAssets = 0
-      
+
       if (totalSupplyShares > 0n) {
         supplyAssets = Number(supplyShares * totalSupplyAssets / totalSupplyShares) / 1e18
       }
       if (totalBorrowShares > 0n) {
         borrowAssets = Number(BigInt(borrowShares) * totalBorrowAssets / totalBorrowShares) / 1e18
       }
-      
+
       setUserPosition({
         supplyShares,
         borrowShares: BigInt(borrowShares),
@@ -198,6 +241,161 @@ export default function Dashboard() {
       })
     }
   }, [positionData, marketData])
+
+  // Calculate current Health Factor for existing position
+  useEffect(() => {
+    if (oraclePrice && userPosition.collateral > 0n && userPosition.borrowAssets > 0) {
+      const collateral = userPosition.collateral
+      const borrowAssetsBigInt = parseUnits(userPosition.borrowAssets.toFixed(18), 18)
+      
+      if (borrowAssetsBigInt > 0n) {
+        const lltv = marketParams.lltv
+        const maxBorrow = (collateral * oraclePrice * lltv) / (ORACLE_PRICE_SCALE * WAD)
+        const hfScaled = (maxBorrow * WAD) / borrowAssetsBigInt
+        let hf = Number(hfScaled) / 1e18
+        // Bounds checking for NaN/Infinity
+        if (!isFinite(hf) || hf > 1000) hf = 1000
+        if (hf < 0) hf = 0
+        setCurrentHF(hf)
+      } else {
+        setCurrentHF(null)
+      }
+    } else {
+      setCurrentHF(null)
+    }
+  }, [oraclePrice, userPosition])
+
+  // === Liquidation Functions ===
+  const checkBorrowerPosition = useCallback(async (borrowerAddress: string) => {
+    if (!publicClient || !oraclePrice || !marketData || !borrowerAddress) return null
+    
+    try {
+      const position = await publicClient.readContract({
+        address: ADDRESSES.MORPHO,
+        abi: morphoAbi,
+        functionName: 'position',
+        args: [MARKET_ID, borrowerAddress as `0x${string}`],
+      })
+
+      const [, borrowShares, collateral] = position
+      const totalBorrowAssets = marketData[2]
+      const totalBorrowShares = marketData[3]
+
+      if (BigInt(borrowShares) === 0n) return null
+
+      const borrowAssets = Number(BigInt(borrowShares) * totalBorrowAssets / totalBorrowShares) / 1e18
+      const borrowAssetsBigInt = BigInt(borrowShares) * totalBorrowAssets / totalBorrowShares
+
+      // Calculate Health Factor
+      const lltv = marketParams.lltv
+      const maxBorrow = (BigInt(collateral) * oraclePrice * lltv) / (ORACLE_PRICE_SCALE * WAD)
+      const hfScaled = borrowAssetsBigInt > 0n ? (maxBorrow * WAD) / borrowAssetsBigInt : 0n
+      const healthFactor = Number(hfScaled) / 1e18
+
+      // Liquidation incentive (typically 5-15% for Morpho)
+      const liquidationIncentive = 1.05 // 5% bonus
+
+      // Max seizable collateral (in UPKRW)
+      const maxSeizable = BigInt(collateral)
+
+      return {
+        borrower: borrowerAddress as `0x${string}`,
+        collateral: BigInt(collateral),
+        borrowShares: BigInt(borrowShares),
+        borrowAssets,
+        healthFactor,
+        maxSeizable,
+        liquidationIncentive,
+      }
+    } catch (error) {
+      console.error('Error checking position:', error)
+      return null
+    }
+  }, [publicClient, oraclePrice, marketData])
+
+  const handleCheckBorrower = async () => {
+    if (!borrowerToCheck) return
+    setIsLoadingPositions(true)
+    
+    const position = await checkBorrowerPosition(borrowerToCheck)
+    if (position) {
+      // Check if already in list
+      const exists = liquidatablePositions.find(p => p.borrower.toLowerCase() === position.borrower.toLowerCase())
+      if (!exists) {
+        setLiquidatablePositions(prev => [...prev, position])
+      } else {
+        // Update existing
+        setLiquidatablePositions(prev => 
+          prev.map(p => p.borrower.toLowerCase() === position.borrower.toLowerCase() ? position : p)
+        )
+      }
+    }
+    setBorrowerToCheck('')
+    setIsLoadingPositions(false)
+  }
+
+  const executeLiquidation = async () => {
+    if (!selectedBorrower || !liquidateAmount || !isConnected) return
+
+    const seizeAmount = parseUnits(liquidateAmount, 18)
+    
+    // First approve UPETH for repaying debt
+    setLiquidateTxStep('approving')
+    writeContract({
+      address: ADDRESSES.UPETH,
+      abi: erc20Abi,
+      functionName: 'approve',
+      args: [ADDRESSES.MORPHO, seizeAmount * 2n], // Approve extra for safety
+    })
+  }
+
+  const executeLiquidationAfterApprove = async () => {
+    if (!selectedBorrower || !liquidateAmount) return
+
+    const seizeAmount = parseUnits(liquidateAmount, 18)
+    
+    setLiquidateTxStep('liquidating')
+    writeContract({
+      address: ADDRESSES.MORPHO,
+      abi: [...morphoAbi, ...liquidateAbi],
+      functionName: 'liquidate',
+      args: [marketParams, selectedBorrower.borrower, seizeAmount, 0n, '0x' as `0x${string}`],
+    })
+  }
+
+  // Handle liquidation tx success
+  useEffect(() => {
+    if (isTxSuccess && liquidateTxStep === 'approving') {
+      executeLiquidationAfterApprove()
+    } else if (isTxSuccess && liquidateTxStep === 'liquidating') {
+      // Save borrower address BEFORE clearing state (fix stale closure)
+      const borrowerAddress = selectedBorrower?.borrower
+      
+      // Reset UI state
+      setLiquidateTxStep('idle')
+      setSelectedBorrower(null)
+      setLiquidateAmount('')
+      
+      // Refetch all data including market data
+      Promise.all([
+        refetchUpethBalance(),
+        refetchUpkrwBalance(),
+        refetchPosition(),
+        refetchMarket()
+      ]).then(() => {
+        // Refresh the liquidated position using saved address
+        if (borrowerAddress) {
+          checkBorrowerPosition(borrowerAddress).then(pos => {
+            if (pos) {
+              setLiquidatablePositions(prev => 
+                prev.map(p => p.borrower === pos.borrower ? pos : p)
+              )
+            }
+          })
+        }
+      })
+    }
+  }, [isTxSuccess, liquidateTxStep, selectedBorrower, refetchUpethBalance, refetchUpkrwBalance, refetchPosition, refetchMarket, checkBorrowerPosition])
 
   // === Computed Values ===
   const utilization = marketData && marketData[0] > 0n
@@ -230,24 +428,29 @@ export default function Dashboard() {
 
   const calculateHealthFactor = (newBorrowETH: number, newCollateralKRW: number): number | null => {
     if (!oraclePrice) return null
-    
+
     const existingCollateral = userPosition.collateral
-    const existingBorrow = parseUnits(userPosition.borrowAssets.toString(), 18)
-    
-    const newCollateralBigInt = parseUnits(newCollateralKRW.toString(), 18)
-    const newBorrowBigInt = parseUnits(newBorrowETH.toString(), 18)
-    
+    // borrowAssets is already in ETH units (divided by 1e18), so multiply back
+    const existingBorrowBigInt = parseUnits(userPosition.borrowAssets.toFixed(18), 18)
+
+    const newCollateralBigInt = parseUnits(newCollateralKRW.toFixed(18), 18)
+    const newBorrowBigInt = parseUnits(newBorrowETH.toFixed(18), 18)
+
     const totalCollateral = existingCollateral + newCollateralBigInt
-    const totalBorrow = existingBorrow + newBorrowBigInt
-    
+    const totalBorrow = existingBorrowBigInt + newBorrowBigInt
+
     if (totalBorrow <= 0n) return null
     if (totalCollateral <= 0n) return null
-    
+
     const lltv = marketParams.lltv
     const maxBorrow = (totalCollateral * oraclePrice * lltv) / (ORACLE_PRICE_SCALE * WAD)
     const hfScaled = (maxBorrow * WAD) / totalBorrow
     const hf = Number(hfScaled) / 1e18
-    
+
+    // Bounds checking for NaN/Infinity
+    if (!isFinite(hf) || hf > 1000) return 1000
+    if (hf < 0) return 0
+
     return hf
   }
 
@@ -257,7 +460,7 @@ export default function Dashboard() {
       setSimulatedHF(null)
       return
     }
-    
+
     if (selection === 'UPETH_BORROW') {
       const borrowAmount = parseFloat(value)
       const collateral = parseFloat(collateralAmount) || 0
@@ -277,20 +480,39 @@ export default function Dashboard() {
       const isBorrow = selection === 'UPETH_BORROW'
 
       if (isBorrow) {
-        if (!collateralAmount) {
-          alert('담보 금액을 입력하세요')
+        const hasExistingCollateral = userPosition.collateral > 0n
+        const hasNewCollateral = collateralAmount && parseFloat(collateralAmount) > 0
+        
+        // 기존 담보도 없고 새 담보도 없으면 에러
+        if (!hasExistingCollateral && !hasNewCollateral) {
+          setErrorMessage('담보 금액을 입력하세요')
+          setTimeout(() => setErrorMessage(null), 4000)
           return
         }
-        const collateralAmt = parseUnits(collateralAmount, 18)
-        approvedCollateralRef.current = collateralAmt
+        
         borrowAmountRef.current = amount
-        setTxStep('approving')
-        writeContract({
-          address: ADDRESSES.UPKRW,
-          abi: erc20Abi,
-          functionName: 'approve',
-          args: [ADDRESSES.MORPHO, collateralAmt],
-        })
+        
+        // 새 담보가 있으면 approve -> supplyCollateral -> borrow 플로우
+        if (hasNewCollateral) {
+          const collateralAmt = parseUnits(collateralAmount, 18)
+          approvedCollateralRef.current = collateralAmt
+          setTxStep('approving')
+          writeContract({
+            address: ADDRESSES.UPKRW,
+            abi: erc20Abi,
+            functionName: 'approve',
+            args: [ADDRESSES.MORPHO, collateralAmt],
+          })
+        } else {
+          // 기존 담보만 있으면 바로 borrow
+          setTxStep('borrowing')
+          writeContract({
+            address: ADDRESSES.MORPHO,
+            abi: morphoAbi,
+            functionName: 'borrow',
+            args: [marketParams, amount, 0n, address!, address!],
+          })
+        }
       } else {
         const token = selection === 'UPKRW' ? ADDRESSES.UPKRW : ADDRESSES.UPETH
         approvedCollateralRef.current = amount
@@ -329,14 +551,16 @@ export default function Dashboard() {
         if (userPosition.borrowAssets > 0 && oraclePrice) {
           const remainingCollateral = userPosition.collateral - amount
           if (remainingCollateral < 0n) {
-            alert('인출 금액이 담보보다 큽니다')
+            setErrorMessage('인출 금액이 담보보다 큽니다')
+            setTimeout(() => setErrorMessage(null), 4000)
             return
           }
           const existingBorrow = parseUnits(userPosition.borrowAssets.toString(), 18)
           const lltv = marketParams.lltv
           const maxBorrow = (remainingCollateral * oraclePrice * lltv) / (ORACLE_PRICE_SCALE * WAD)
           if (existingBorrow > maxBorrow) {
-            alert('Health Factor가 1 미만이 됩니다. 먼저 대출을 상환하세요.')
+            setErrorMessage('Health Factor가 1 미만이 됩니다. 먼저 대출을 상환하세요.')
+            setTimeout(() => setErrorMessage(null), 4000)
             return
           }
         }
@@ -366,7 +590,7 @@ export default function Dashboard() {
 
   const executeAfterApprove = async () => {
     if (!isConnected || !selection) return
-    
+
     const amount = approvedCollateralRef.current
     if (amount === 0n) {
       console.error('No approved amount stored')
@@ -417,7 +641,7 @@ export default function Dashboard() {
 
   const executeBorrow = async () => {
     if (!isConnected || selection !== 'UPETH_BORROW') return
-    
+
     const borrowAmount = borrowAmountRef.current
     if (borrowAmount === 0n) {
       console.error('No borrow amount stored')
@@ -456,7 +680,7 @@ export default function Dashboard() {
 
   const getButtonText = () => {
     if (!isConnected) return 'Connect Wallet'
-    
+
     if (actionMode === 'withdraw') {
       if (selection === 'UPETH_BORROW') {
         switch (txStep) {
@@ -472,7 +696,7 @@ export default function Dashboard() {
         }
       }
     }
-    
+
     if (selection === 'UPETH_BORROW') {
       switch (txStep) {
         case 'approving': return 'APPROVING...'
@@ -515,7 +739,54 @@ export default function Dashboard() {
     if (isTxPending) return true
     if (txStep === 'approving' || txStep === 'supplying_collateral' || txStep === 'borrowing' || txStep === 'executing') return true
     if (executionStatus === 'confirmed') return true
+    
+    // Block if no input amount
+    if (!inputAmount || parseFloat(inputAmount) <= 0) return true
+    
+    // Block if amount exceeds balance
+    const amount = parseFloat(inputAmount)
+    const maxAmount = getMaxAmount()
+    if (amount > maxAmount) return true
+    
+    // CRITICAL: Block borrowing if HF < 1
+    if (selection === 'UPETH_BORROW' && actionMode === 'supply') {
+      if (simulatedHF !== null && simulatedHF < 1.0) return true
+      // Block if no collateral (neither existing nor new)
+      const hasExistingCollateral = userPosition.collateral > 0n
+      const hasNewCollateral = collateralAmount && parseFloat(collateralAmount) > 0
+      if (!hasExistingCollateral && !hasNewCollateral) return true
+    }
+    
     return false
+  }
+  
+  // Get reason why button is disabled
+  const getDisabledReason = (): string | null => {
+    if (!isConnected) return null
+    if (isTxPending || txStep !== 'idle') return null
+    
+    if (!inputAmount || parseFloat(inputAmount) <= 0) {
+      return 'Enter amount'
+    }
+    
+    const amount = parseFloat(inputAmount)
+    const maxAmount = getMaxAmount()
+    if (amount > maxAmount) {
+      return `Insufficient balance (Max: ${fmtCompact(maxAmount)})`
+    }
+    
+    if (selection === 'UPETH_BORROW' && actionMode === 'supply') {
+      if (simulatedHF !== null && simulatedHF < 1.0) {
+        return `Health Factor ${simulatedHF.toFixed(2)} is below 1.0 - Position would be liquidatable`
+      }
+      const hasExistingCollateral = userPosition.collateral > 0n
+      const hasNewCollateral = collateralAmount && parseFloat(collateralAmount) > 0
+      if (!hasExistingCollateral && !hasNewCollateral) {
+        return 'Enter collateral amount'
+      }
+    }
+    
+    return null
   }
 
   const getMaxAmount = () => {
@@ -560,7 +831,7 @@ export default function Dashboard() {
             <span className="font-serif italic text-2xl tracking-wide font-bold text-white">Coin Billigi</span>
             <span className="font-mono text-[10px] text-[#888888] tracking-widest uppercase">by koracle</span>
           </div>
-          
+
           <div className="hidden md:flex items-center space-x-8 text-sm font-medium text-[#888888] font-mono">
             <button onClick={() => navigate('dashboard')} className={`hover:text-[#D4FF00] transition-colors ${currentView === 'dashboard' ? 'text-white' : ''}`}>PROTOCOL</button>
             <button onClick={() => navigate('liquidate')} className={`hover:text-[#D4FF00] transition-colors ${currentView === 'liquidate' ? 'text-white' : ''}`}>LIQUIDATION <span className="text-[10px] text-[#FF6B6B] align-top ml-0.5">●</span></button>
@@ -580,12 +851,12 @@ export default function Dashboard() {
         </nav>
 
         {/* Main Layout */}
-        <main className="flex-1 flex overflow-hidden z-10 relative">
-          {/* Center Stage (Content) */}
+        <main className="flex-1 flex gap-0 overflow-hidden z-10 relative">
+          {/* Center Stage (Content) - Full width */}
           <div className="flex-1 overflow-y-auto scroll-hide scroll-smooth relative">
-            <div className="max-w-[1400px] mx-auto p-6 md:p-12 pb-32">
+            <div className="w-full p-6 md:p-12 pb-32">
               <div className="space-y-12">
-                
+
                 {currentView === 'dashboard' && (
                   <div className="fade-in space-y-16">
                     {/* Hero */}
@@ -625,6 +896,67 @@ export default function Dashboard() {
                       </div>
                     </section>
 
+                    {/* My Position Panel */}
+                    {isConnected && (userPosition.supplyAssets > 0 || userPosition.borrowAssets > 0 || userPosition.collateral > 0n) && (
+                      <section className="grid grid-cols-1 lg:grid-cols-4 gap-6">
+                        <div className="lg:col-span-4 flex items-center justify-between border-b border-white/10 pb-4 mb-2">
+                          <h2 className="font-sans font-medium text-xl flex items-center">
+                            <span className="w-2 h-2 bg-[#D4FF00] rounded-full mr-3" />My Position
+                          </h2>
+                          <span className="font-mono text-[10px] uppercase text-[#888888]">Real-time Dashboard</span>
+                        </div>
+                        
+                        {/* Supplied */}
+                        <div className="p-5 border border-white/10 bg-white/[0.02] overflow-hidden">
+                          <div className="font-mono text-[10px] uppercase text-[#888888] mb-2">Supplied</div>
+                          <div className="text-2xl font-mono text-white truncate">{fmtCompact(userPosition.supplyAssets)}</div>
+                          <div className="text-xs text-[#888888] mt-1">UPETH</div>
+                        </div>
+
+                        {/* Collateral */}
+                        <div className="p-5 border border-white/10 bg-white/[0.02] overflow-hidden">
+                          <div className="font-mono text-[10px] uppercase text-[#888888] mb-2">Collateral</div>
+                          <div className="text-2xl font-mono text-white truncate">{fmtCompact(Number(userPosition.collateral) / 1e18)}</div>
+                          <div className="text-xs text-[#888888] mt-1">UPKRW</div>
+                        </div>
+
+                        {/* Borrowed */}
+                        <div className="p-5 border border-white/10 bg-white/[0.02] overflow-hidden">
+                          <div className="font-mono text-[10px] uppercase text-[#888888] mb-2">Borrowed</div>
+                          <div className="text-2xl font-mono text-white truncate">{fmtCompact(userPosition.borrowAssets)}</div>
+                          <div className="text-xs text-[#888888] mt-1">UPETH</div>
+                        </div>
+
+                        {/* Health Factor */}
+                        <div className={`p-5 border bg-white/[0.02] ${currentHF === null ? 'border-white/10' : currentHF < 1.0 ? 'border-red-500/50 bg-red-500/10' : currentHF < 1.1 ? 'border-orange-500/50 bg-orange-500/10' : currentHF < 1.5 ? 'border-yellow-500/50 bg-yellow-500/10' : 'border-green-500/50 bg-green-500/10'}`}>
+                          <div className="font-mono text-[10px] uppercase text-[#888888] mb-2">Health Factor</div>
+                          <div className={`text-2xl font-mono ${currentHF === null ? 'text-[#888888]' : currentHF < 1.0 ? 'text-red-500' : currentHF < 1.1 ? 'text-orange-500' : currentHF < 1.5 ? 'text-yellow-500' : 'text-green-400'}`}>
+                            {currentHF !== null ? currentHF.toFixed(2) : '∞'}
+                          </div>
+                          <div className="text-xs text-[#888888] mt-1">{currentHF !== null && currentHF < 1.1 ? 'At Risk!' : 'Safe'}</div>
+                        </div>
+
+                        {/* Additional Stats Row */}
+                        <div className="lg:col-span-2 p-5 border border-white/10 bg-white/[0.02] overflow-hidden">
+                          <div className="font-mono text-[10px] uppercase text-[#888888] mb-2">Kimchi Premium</div>
+                          <div className="flex items-center justify-between gap-2">
+                            <div className={`text-2xl font-mono truncate ${isKimchiRisk ? 'text-[#FF6B6B]' : 'text-[#D4FF00]'}`}>{kimchi.toFixed(2)}%</div>
+                            <div className={`text-xs px-2 py-1 rounded whitespace-nowrap ${isKimchiRisk ? 'bg-red-500/20 text-red-400' : 'bg-green-500/20 text-green-400'}`}>
+                              {isKimchiRisk ? 'HIGH' : 'OK'}
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="lg:col-span-2 p-5 border border-white/10 bg-white/[0.02] overflow-hidden">
+                          <div className="font-mono text-[10px] uppercase text-[#888888] mb-2">Oracle Price</div>
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="text-2xl font-mono text-white truncate">₩{fmtCompact(ethPrice)}</div>
+                            <div className="text-xs text-[#888888] whitespace-nowrap">per ETH</div>
+                          </div>
+                        </div>
+                      </section>
+                    )}
+
                     {/* Market Grid */}
                     <div className="grid grid-cols-1 xl:grid-cols-2 gap-16">
                       {/* Earn */}
@@ -637,27 +969,27 @@ export default function Dashboard() {
                         </div>
 
                         <div>
-                          <div className="grid grid-cols-4 font-mono text-[10px] uppercase text-[#888888] px-4 pb-4 opacity-50">
+                          <div className="grid grid-cols-[2fr_1fr_1fr_40px] font-mono text-[10px] uppercase text-[#888888] px-5 pb-4 opacity-50">
                             <span>Asset</span><span className="text-right">APY</span><span className="text-right">Balance</span><span />
                           </div>
 
-                          <div onClick={() => selectMarket('UPETH')} className={`group grid grid-cols-4 items-center p-5 border cursor-pointer transition-all ${selection === 'UPETH' ? 'border-[#D4FF00] bg-white/[0.04]' : 'border-white/5 hover:border-[#D4FF00] bg-white/[0.02] hover:bg-white/[0.04]'}`}>
-                            <div className="flex items-center space-x-4">
-                              <svg className="w-6 h-6" viewBox="0 0 32 32"><g fill="none" fillRule="evenodd"><circle cx="16" cy="16" r="16" fill="#627EEA"/><path fill="#FFF" fillOpacity=".602" d="M16.498 4v8.87l7.497 3.35z"/><path fill="#FFF" d="M16.498 4L9 16.22l7.498-3.35z"/><path fill="#FFF" fillOpacity=".602" d="M16.498 21.968l7.497-4.353-7.497-3.348z"/><path fill="#FFF" d="M9 17.615l7.498 4.353v-7.701z"/><path fill="#FFF" fillOpacity=".2" d="M16.498 20.573l7.497-4.353-7.497 10.291z"/><path fill="#FFF" fillOpacity=".602" d="M9 16.22l7.498 4.353v1.791z"/></g></svg>
+                          <div onClick={() => selectMarket('UPETH')} className={`group grid grid-cols-[2fr_1fr_1fr_40px] items-center p-5 border cursor-pointer transition-all ${selection === 'UPETH' ? 'border-[#D4FF00] bg-white/[0.04]' : 'border-white/5 hover:border-[#D4FF00] bg-white/[0.02] hover:bg-white/[0.04]'}`}>
+                            <div className="flex items-center space-x-3">
+                              <svg className="w-8 h-8 flex-shrink-0" viewBox="0 0 32 32"><g fill="none" fillRule="evenodd"><circle cx="16" cy="16" r="16" fill="#627EEA"/><path fill="#FFF" fillOpacity=".602" d="M16.498 4v8.87l7.497 3.35z"/><path fill="#FFF" d="M16.498 4L9 16.22l7.498-3.35z"/><path fill="#FFF" fillOpacity=".602" d="M16.498 21.968l7.497-4.353-7.497-3.348z"/><path fill="#FFF" d="M9 17.615l7.498 4.353v-7.701z"/><path fill="#FFF" fillOpacity=".2" d="M16.498 20.573l7.497-4.353-7.497 10.291z"/><path fill="#FFF" fillOpacity=".602" d="M9 16.22l7.498 4.353v1.791z"/></g></svg>
                               <span className="font-bold text-lg">UPETH</span>
                             </div>
                             <div className="text-right font-mono text-[#D4FF00] text-lg">{supplyApy}%</div>
-                            <div className="text-right font-mono text-[#888888]">{isConnected ? upethBalance.toFixed(4) : '-'}</div>
+                            <div className="text-right font-mono text-[#888888]">{isConnected ? fmtCompact(upethBalance) : '-'}</div>
                             <div className="flex justify-end"><span className="material-symbols-outlined text-[#888888] group-hover:text-[#D4FF00] transition-colors">arrow_forward</span></div>
                           </div>
 
-                          <div onClick={() => selectMarket('UPKRW')} className={`group grid grid-cols-4 items-center p-5 border-b border-x cursor-pointer transition-all mt-[-1px] ${selection === 'UPKRW' ? 'border-[#D4FF00] bg-white/[0.04]' : 'border-white/5 hover:border-white/20 bg-white/[0.01]'}`}>
-                            <div className="flex items-center space-x-4">
-                              <div className="w-6 h-6 rounded-full bg-gradient-to-br from-red-500 to-blue-600 flex items-center justify-center text-[10px] font-bold text-white border border-white/10">₩</div>
+                          <div onClick={() => selectMarket('UPKRW')} className={`group grid grid-cols-[2fr_1fr_1fr_40px] items-center p-5 border-b border-x cursor-pointer transition-all mt-[-1px] ${selection === 'UPKRW' ? 'border-[#D4FF00] bg-white/[0.04]' : 'border-white/5 hover:border-white/20 bg-white/[0.01]'}`}>
+                            <div className="flex items-center space-x-3">
+                              <div className="w-8 h-8 flex-shrink-0 rounded-full bg-gradient-to-br from-red-500 to-blue-600 flex items-center justify-center text-xs font-bold text-white border border-white/10">₩</div>
                               <span className="font-bold text-lg">UPKRW</span>
                             </div>
                             <div className="text-right font-mono text-white text-lg">2.1%</div>
-                            <div className="text-right font-mono text-[#888888]">{isConnected ? fmt(upkrwBalance) : '-'}</div>
+                            <div className="text-right font-mono text-[#888888]">{isConnected ? fmtCompact(upkrwBalance) : '-'}</div>
                             <div className="flex justify-end"><span className="material-symbols-outlined text-[#888888] group-hover:text-white transition-colors">arrow_forward</span></div>
                           </div>
                         </div>
@@ -673,17 +1005,17 @@ export default function Dashboard() {
                         </div>
 
                         <div>
-                          <div className="grid grid-cols-4 font-mono text-[10px] uppercase text-[#888888] px-4 pb-4 opacity-50">
+                          <div className="grid grid-cols-[2fr_1fr_1fr_40px] font-mono text-[10px] uppercase text-[#888888] px-5 pb-4 opacity-50">
                             <span>Asset</span><span className="text-right">Max LTV</span><span className="text-right">Liquidity</span><span />
                           </div>
 
-                          <div onClick={() => selectMarket('UPETH_BORROW')} className={`group grid grid-cols-4 items-center p-5 border cursor-pointer transition-all ${selection === 'UPETH_BORROW' ? 'border-white bg-white/[0.05]' : 'border-white/5 hover:border-white hover:bg-white/[0.05] bg-white/[0.02]'}`}>
-                            <div className="flex items-center space-x-4">
-                              <svg className="w-6 h-6" viewBox="0 0 32 32"><g fill="none" fillRule="evenodd"><circle cx="16" cy="16" r="16" fill="#627EEA"/><path fill="#FFF" fillOpacity=".602" d="M16.498 4v8.87l7.497 3.35z"/><path fill="#FFF" d="M16.498 4L9 16.22l7.498-3.35z"/><path fill="#FFF" fillOpacity=".602" d="M16.498 21.968l7.497-4.353-7.497-3.348z"/><path fill="#FFF" d="M9 17.615l7.498 4.353v-7.701z"/><path fill="#FFF" fillOpacity=".2" d="M16.498 20.573l7.497-4.353-7.497 10.291z"/><path fill="#FFF" fillOpacity=".602" d="M9 16.22l7.498 4.353v1.791z"/></g></svg>
+                          <div onClick={() => selectMarket('UPETH_BORROW')} className={`group grid grid-cols-[2fr_1fr_1fr_40px] items-center p-5 border cursor-pointer transition-all ${selection === 'UPETH_BORROW' ? 'border-white bg-white/[0.05]' : 'border-white/5 hover:border-white hover:bg-white/[0.05] bg-white/[0.02]'}`}>
+                            <div className="flex items-center space-x-3">
+                              <svg className="w-8 h-8 flex-shrink-0" viewBox="0 0 32 32"><g fill="none" fillRule="evenodd"><circle cx="16" cy="16" r="16" fill="#627EEA"/><path fill="#FFF" fillOpacity=".602" d="M16.498 4v8.87l7.497 3.35z"/><path fill="#FFF" d="M16.498 4L9 16.22l7.498-3.35z"/><path fill="#FFF" fillOpacity=".602" d="M16.498 21.968l7.497-4.353-7.497-3.348z"/><path fill="#FFF" d="M9 17.615l7.498 4.353v-7.701z"/><path fill="#FFF" fillOpacity=".2" d="M16.498 20.573l7.497-4.353-7.497 10.291z"/><path fill="#FFF" fillOpacity=".602" d="M9 16.22l7.498 4.353v1.791z"/></g></svg>
                               <span className="font-bold text-lg">UPETH</span>
                             </div>
                             <div className="text-right font-mono text-[#888888] text-lg">92%</div>
-                            <div className="text-right font-mono text-green-400 text-xs uppercase tracking-widest pt-1">Deep</div>
+                            <div className="text-right font-mono text-green-400 text-xs uppercase tracking-widest">Deep</div>
                             <div className="flex justify-end"><span className="material-symbols-outlined text-[#888888] group-hover:text-white transition-colors">arrow_forward</span></div>
                           </div>
                         </div>
@@ -710,14 +1042,208 @@ export default function Dashboard() {
 
                 {currentView === 'liquidate' && (
                   <div className="fade-in space-y-8">
+                    {/* Header */}
                     <div className="border-b border-white/10 pb-6 flex flex-col md:flex-row justify-between md:items-end gap-4">
                       <div>
                         <h1 className="text-4xl font-serif italic mb-2">Liquidation <span className="not-italic font-sans font-light text-[#888888]">Terminal</span></h1>
-                        <p className="font-mono text-xs text-[#888888] max-w-md mt-2">Monitor undercollateralized positions.<br /><span className="text-[#FF6B6B]">Kimchi Premium affects liquidation thresholds.</span></p>
+                        <p className="font-mono text-xs text-[#888888] max-w-md mt-2">Monitor undercollateralized positions.<br /><span className="text-[#FF6B6B]">Health Factor &lt; 1.0 = Liquidatable</span></p>
                       </div>
                       <div className="text-left md:text-right">
                         <div className="font-mono text-xs text-[#888888] mb-1">ORACLE PRICE</div>
                         <div className="font-mono text-xl text-white">1 ETH = {fmt(ethPrice)} KRW</div>
+                      </div>
+                    </div>
+
+                    {/* Add Borrower to Check */}
+                    <div className="p-6 border border-white/10 bg-white/[0.02]">
+                      <div className="font-mono text-[10px] uppercase text-[#888888] mb-4">Check Borrower Position</div>
+                      <div className="flex gap-4">
+                        <input
+                          type="text"
+                          value={borrowerToCheck}
+                          onChange={(e) => setBorrowerToCheck(e.target.value)}
+                          placeholder="0x... borrower address"
+                          className="flex-1 bg-transparent border border-white/20 px-4 py-3 font-mono text-sm text-white focus:outline-none focus:border-[#D4FF00] placeholder-white/30"
+                        />
+                        <button
+                          onClick={handleCheckBorrower}
+                          disabled={!borrowerToCheck || isLoadingPositions}
+                          className="px-6 py-3 bg-[#D4FF00] text-black font-mono text-sm font-bold uppercase hover:bg-[#c4ef00] disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                        >
+                          {isLoadingPositions ? 'Checking...' : 'Check'}
+                        </button>
+                      </div>
+                      <p className="font-mono text-[10px] text-[#888888] mt-2">Enter a borrower address to check their position and Health Factor</p>
+                    </div>
+
+                    {/* Positions Table */}
+                    <div className="border border-white/10 bg-white/[0.02]">
+                      <div className="p-4 border-b border-white/10 flex justify-between items-center">
+                        <div className="font-mono text-[10px] uppercase text-[#888888]">Tracked Positions</div>
+                        <div className="font-mono text-[10px] text-[#888888]">{liquidatablePositions.length} positions</div>
+                      </div>
+
+                      {liquidatablePositions.length === 0 ? (
+                        <div className="p-12 text-center">
+                          <span className="material-symbols-outlined text-4xl text-[#888888] mb-4">search</span>
+                          <p className="font-mono text-sm text-[#888888]">No positions tracked yet</p>
+                          <p className="font-mono text-xs text-[#888888] mt-1">Add a borrower address above to check their position</p>
+                        </div>
+                      ) : (
+                        <div className="divide-y divide-white/5">
+                          {/* Table Header */}
+                          <div className="grid grid-cols-[2fr_1fr_1fr_1fr_120px] gap-4 px-4 py-3 font-mono text-[10px] uppercase text-[#888888]">
+                            <span>Borrower</span>
+                            <span className="text-right">Collateral</span>
+                            <span className="text-right">Debt</span>
+                            <span className="text-right">Health Factor</span>
+                            <span className="text-right">Action</span>
+                          </div>
+
+                          {/* Position Rows */}
+                          {liquidatablePositions.map((pos) => (
+                            <div 
+                              key={pos.borrower} 
+                              className={`grid grid-cols-[2fr_1fr_1fr_1fr_120px] gap-4 px-4 py-4 items-center transition-colors ${
+                                pos.healthFactor < 1 ? 'bg-red-500/10' : pos.healthFactor < 1.1 ? 'bg-orange-500/10' : ''
+                              }`}
+                            >
+                              <div className="font-mono text-sm text-white truncate">
+                                {pos.borrower.slice(0, 6)}...{pos.borrower.slice(-4)}
+                              </div>
+                              <div className="text-right font-mono text-sm text-white">
+                                {fmtCompact(Number(pos.collateral) / 1e18)} <span className="text-[#888888]">UPKRW</span>
+                              </div>
+                              <div className="text-right font-mono text-sm text-white">
+                                {pos.borrowAssets.toFixed(4)} <span className="text-[#888888]">UPETH</span>
+                              </div>
+                              <div className={`text-right font-mono text-lg font-bold ${
+                                pos.healthFactor < 1 ? 'text-red-500' : 
+                                pos.healthFactor < 1.1 ? 'text-orange-500' : 
+                                pos.healthFactor < 1.5 ? 'text-yellow-500' : 'text-green-400'
+                              }`}>
+                                {pos.healthFactor.toFixed(2)}
+                              </div>
+                              <div className="text-right">
+                                {pos.healthFactor < 1 ? (
+                                  <button
+                                    onClick={() => setSelectedBorrower(pos)}
+                                    className="px-3 py-1.5 bg-[#FF6B6B] text-white font-mono text-xs font-bold uppercase hover:bg-red-400 transition-colors"
+                                  >
+                                    Liquidate
+                                  </button>
+                                ) : (
+                                  <span className="font-mono text-xs text-[#888888]">Healthy</span>
+                                )}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Liquidation Panel */}
+                    {selectedBorrower && (
+                      <div className="p-6 border border-[#FF6B6B] bg-red-500/10">
+                        <div className="flex justify-between items-start mb-6">
+                          <div>
+                            <div className="font-mono text-[10px] uppercase text-[#FF6B6B] mb-2">Liquidate Position</div>
+                            <div className="font-mono text-lg text-white">{selectedBorrower.borrower.slice(0, 10)}...{selectedBorrower.borrower.slice(-8)}</div>
+                          </div>
+                          <button onClick={() => setSelectedBorrower(null)} className="text-[#888888] hover:text-white">
+                            <span className="material-symbols-outlined">close</span>
+                          </button>
+                        </div>
+
+                        <div className="grid grid-cols-3 gap-4 mb-6">
+                          <div className="p-3 bg-black/20 border border-white/10">
+                            <div className="font-mono text-[10px] uppercase text-[#888888] mb-1">Collateral</div>
+                            <div className="font-mono text-lg text-white">{fmtCompact(Number(selectedBorrower.collateral) / 1e18)}</div>
+                            <div className="font-mono text-xs text-[#888888]">UPKRW</div>
+                          </div>
+                          <div className="p-3 bg-black/20 border border-white/10">
+                            <div className="font-mono text-[10px] uppercase text-[#888888] mb-1">Debt</div>
+                            <div className="font-mono text-lg text-white">{selectedBorrower.borrowAssets.toFixed(4)}</div>
+                            <div className="font-mono text-xs text-[#888888]">UPETH</div>
+                          </div>
+                          <div className="p-3 bg-black/20 border border-white/10">
+                            <div className="font-mono text-[10px] uppercase text-[#888888] mb-1">Health Factor</div>
+                            <div className="font-mono text-lg text-red-500">{selectedBorrower.healthFactor.toFixed(4)}</div>
+                            <div className="font-mono text-xs text-[#FF6B6B]">Liquidatable!</div>
+                          </div>
+                        </div>
+
+                        <div className="mb-6">
+                          <div className="flex justify-between font-mono text-[10px] text-[#888888] mb-2 uppercase">
+                            <label>Collateral to Seize (UPKRW)</label>
+                            <span>Max: {fmtCompact(Number(selectedBorrower.collateral) / 1e18)}</span>
+                          </div>
+                          <div className="flex gap-2">
+                            <input
+                              type="text"
+                              inputMode="decimal"
+                              value={liquidateAmount}
+                              onChange={(e) => { const v = e.target.value; if (v === '' || /^\d*\.?\d*$/.test(v)) setLiquidateAmount(v); }}
+                              placeholder="0.00"
+                              className="flex-1 bg-transparent border border-white/20 px-4 py-3 font-mono text-xl text-white focus:outline-none focus:border-[#FF6B6B] placeholder-white/30"
+                            />
+                            <button 
+                              onClick={() => setLiquidateAmount((Number(selectedBorrower.collateral) / 1e18).toString())}
+                              className="px-4 bg-white/10 hover:bg-white/20 text-white font-mono text-xs uppercase transition-colors"
+                            >
+                              MAX
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="p-3 bg-black/20 border border-white/10 mb-6">
+                          <div className="flex justify-between text-sm mb-2">
+                            <span className="font-mono text-[#888888]">Liquidation Incentive</span>
+                            <span className="font-mono text-[#D4FF00]">+5%</span>
+                          </div>
+                          <div className="flex justify-between text-sm">
+                            <span className="font-mono text-[#888888]">You Repay (UPETH)</span>
+                            <span className="font-mono text-white">
+                              ~{liquidateAmount ? (parseFloat(liquidateAmount) / ethPrice * 0.95).toFixed(6) : '0'} UPETH
+                            </span>
+                          </div>
+                        </div>
+
+                        <button
+                          onClick={executeLiquidation}
+                          disabled={!liquidateAmount || liquidateTxStep !== 'idle' || !isConnected}
+                          className="w-full py-4 bg-[#FF6B6B] text-white font-mono font-bold uppercase tracking-wider hover:bg-red-400 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                        >
+                          {liquidateTxStep === 'approving' ? 'Approving...' : 
+                           liquidateTxStep === 'liquidating' ? 'Liquidating...' : 
+                           'Execute Liquidation'}
+                        </button>
+                      </div>
+                    )}
+
+                    {/* Info Box */}
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                      <div className="p-4 border border-white/10 bg-white/[0.02]">
+                        <div className="flex items-start space-x-3">
+                          <span className="material-symbols-outlined text-[#D4FF00]">info</span>
+                          <div>
+                            <div className="font-mono text-sm text-white mb-1">How Liquidation Works</div>
+                            <p className="font-mono text-xs text-[#888888] leading-relaxed">
+                              When Health Factor drops below 1.0, anyone can repay part of the borrower's debt and seize their collateral at a 5% discount.
+                            </p>
+                          </div>
+                        </div>
+                      </div>
+                      <div className="p-4 border border-white/10 bg-white/[0.02]">
+                        <div className="flex items-start space-x-3">
+                          <span className="material-symbols-outlined text-[#FF6B6B]">warning</span>
+                          <div>
+                            <div className="font-mono text-sm text-white mb-1">Kimchi Premium Risk</div>
+                            <p className="font-mono text-xs text-[#888888] leading-relaxed">
+                              High kimchi premium ({kimchi.toFixed(1)}%) increases liquidation risk as oracle price may move against borrowers.
+                            </p>
+                          </div>
+                        </div>
                       </div>
                     </div>
                   </div>
@@ -783,8 +1309,8 @@ export default function Dashboard() {
                       <span>{actionMode === 'withdraw' ? 'Position' : 'Wallet'}: {getMaxAmount().toFixed(4)}</span>
                     </div>
                     <div className="relative">
-                      <input type="number" value={inputAmount} onChange={(e) => simulate(e.target.value)} className="w-full bg-transparent border-b border-white/20 py-4 text-4xl font-mono text-white focus:outline-none focus:border-[#D4FF00] transition-colors placeholder-white/10" placeholder="0.00" />
-                      <button onClick={() => simulate(getMaxAmount().toString())} className="absolute right-0 top-1/2 -translate-y-1/2 text-[10px] font-bold bg-white/10 hover:bg-white/20 text-white px-2 py-1 uppercase transition-colors">MAX</button>
+                      <input type="text" inputMode="decimal" value={inputAmount} onChange={(e) => { const v = e.target.value; if (v === '' || /^\d*\.?\d*$/.test(v)) simulate(v); }} className="w-full bg-transparent border-b border-white/20 py-4 text-4xl font-mono text-white focus:outline-none focus:border-[#D4FF00] transition-colors placeholder-white/10" placeholder="0.00" />
+                      <button onClick={() => simulate(getMaxAmount().toString())} disabled={getMaxAmount() === 0 || !isConnected} className="absolute right-0 top-1/2 -translate-y-1/2 text-[10px] font-bold bg-white/10 hover:bg-white/20 text-white px-2 py-1 uppercase transition-colors disabled:opacity-30 disabled:cursor-not-allowed">MAX</button>
                     </div>
                   </div>
 
@@ -797,9 +1323,12 @@ export default function Dashboard() {
                       </div>
                       <div className="flex items-center space-x-2 border-b border-white/20 pb-2">
                         <div className="w-6 h-6 rounded-full bg-gradient-to-br from-red-500 to-blue-600 flex items-center justify-center text-[10px] font-bold text-white">₩</div>
-                        <input type="number" value={collateralAmount} onChange={(e) => { setCollateralAmount(e.target.value); if (inputAmount) { setSimulatedHF(calculateHealthFactor(parseFloat(inputAmount), parseFloat(e.target.value) || 0)); } }} className="w-full bg-transparent py-2 text-xl font-mono text-white focus:outline-none placeholder-white/10" placeholder="0" />
-                        <button onClick={() => { setCollateralAmount(upkrwBalance.toString()); if (inputAmount) { setSimulatedHF(calculateHealthFactor(parseFloat(inputAmount), upkrwBalance)); } }} className="text-[10px] font-bold bg-white/10 hover:bg-white/20 text-white px-2 py-1 uppercase transition-colors">MAX</button>
+                        <input type="text" inputMode="decimal" value={collateralAmount} onChange={(e) => { const v = e.target.value; if (v === '' || /^\d*\.?\d*$/.test(v)) { setCollateralAmount(v); if (inputAmount) { setSimulatedHF(calculateHealthFactor(parseFloat(inputAmount), parseFloat(v) || 0)); } } }} className={`w-full bg-transparent py-2 text-xl font-mono focus:outline-none placeholder-white/10 ${collateralAmount && parseFloat(collateralAmount) > upkrwBalance ? 'text-red-500' : 'text-white'}`} placeholder="0" />
+                        <button onClick={() => { setCollateralAmount(upkrwBalance.toString()); if (inputAmount) { setSimulatedHF(calculateHealthFactor(parseFloat(inputAmount), upkrwBalance)); } }} disabled={upkrwBalance === 0 || !isConnected} className="text-[10px] font-bold bg-white/10 hover:bg-white/20 text-white px-2 py-1 uppercase transition-colors disabled:opacity-30 disabled:cursor-not-allowed">MAX</button>
                       </div>
+                      {collateralAmount && parseFloat(collateralAmount) > upkrwBalance && (
+                        <div className="text-xs text-red-500 font-mono mt-1">잔액 초과 (최대: {fmtCompact(upkrwBalance)})</div>
+                      )}
                     </div>
                   )}
 
@@ -809,7 +1338,7 @@ export default function Dashboard() {
                       <span className="text-[#888888] font-mono text-xs uppercase">Est. APY</span>
                       <span className="font-mono text-white">{selection === 'UPETH_BORROW' ? borrowApy : supplyApy}%</span>
                     </div>
-                    
+
                     {selection === 'UPETH_BORROW' && actionMode === 'supply' && (
                       <>
                         <div className="h-px bg-white/10 my-2" />
@@ -838,20 +1367,90 @@ export default function Dashboard() {
                     </div>
                   )}
 
+                  {/* General Error Message (replaces alert()) */}
+                  {errorMessage && (
+                    <div className="mb-4 p-4 border-2 border-red-500 bg-red-500/20">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center space-x-2">
+                          <span className="material-symbols-outlined text-red-500">error</span>
+                          <span className="font-mono text-sm text-red-400">{errorMessage}</span>
+                        </div>
+                        <button onClick={() => setErrorMessage(null)} className="text-red-400 hover:text-red-300">
+                          <span className="material-symbols-outlined text-sm">close</span>
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* CRITICAL: HF Error Messages */}
+                  {selection === 'UPETH_BORROW' && actionMode === 'supply' && simulatedHF !== null && simulatedHF < 1.0 && (
+                    <div className="mb-4 p-4 border-2 border-red-500 bg-red-500/20">
+                      <div className="flex items-start space-x-3">
+                        <span className="material-symbols-outlined text-red-500 text-xl">error</span>
+                        <div>
+                          <div className="font-mono text-sm text-red-500 font-bold mb-1">TRANSACTION BLOCKED</div>
+                          <p className="font-mono text-xs text-red-400 leading-relaxed">
+                            Health Factor {simulatedHF.toFixed(2)} is below 1.0. Your position would be immediately liquidatable. 
+                            Reduce borrow amount or increase collateral.
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Warning: HF between 1.0 - 1.1 */}
+                  {selection === 'UPETH_BORROW' && actionMode === 'supply' && simulatedHF !== null && simulatedHF >= 1.0 && simulatedHF < 1.1 && (
+                    <div className="mb-4 p-4 border border-orange-500 bg-orange-500/10">
+                      <div className="flex items-start space-x-3">
+                        <span className="material-symbols-outlined text-orange-500">warning</span>
+                        <div>
+                          <div className="font-mono text-sm text-orange-500 font-bold mb-1">HIGH RISK POSITION</div>
+                          <p className="font-mono text-xs text-orange-400 leading-relaxed">
+                            Health Factor {simulatedHF.toFixed(2)} is very low. Small price movements could trigger liquidation.
+                            Consider adding more collateral for safety.
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Disabled Reason Display */}
+                  {getDisabledReason() && txStep === 'idle' && (
+                    <div className="mb-4 p-3 border border-white/20 bg-white/5">
+                      <p className="font-mono text-xs text-[#888888] text-center">
+                        {getDisabledReason()}
+                      </p>
+                    </div>
+                  )}
+
                   {/* Action Button */}
                   <div className="mt-8 space-y-3">
-                    <button onClick={handleButtonClick} disabled={isButtonDisabled()} className={`w-full py-5 font-bold font-mono uppercase tracking-widest text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${executionStatus === 'confirmed' ? 'bg-[#D4FF00] text-black' : actionMode === 'withdraw' ? 'bg-[#FF6B6B] text-black hover:bg-red-400' : 'bg-white text-black hover:bg-[#D4FF00]'}`}>
-                      {executionStatus === 'confirmed' ? 'CONFIRMED' : getButtonText()}
+                    <button onClick={handleButtonClick} disabled={isButtonDisabled()} className={`w-full py-5 font-bold font-mono uppercase tracking-widest text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${executionStatus === 'confirmed' ? 'bg-[#D4FF00] text-black' : actionMode === 'withdraw' ? 'bg-[#FF6B6B] text-black hover:bg-red-400' : simulatedHF !== null && simulatedHF < 1.0 ? 'bg-red-900 text-red-300 cursor-not-allowed' : 'bg-white text-black hover:bg-[#D4FF00]'}`}>
+                      {executionStatus === 'confirmed' ? 'CONFIRMED' : simulatedHF !== null && simulatedHF < 1.0 ? 'BLOCKED: HF TOO LOW' : getButtonText()}
                     </button>
-                    
-                    {selection === 'UPETH_BORROW' && actionMode === 'supply' && (
+
+                    {selection === 'UPETH_BORROW' && actionMode === 'supply' && txStep !== 'idle' && (
                       <div className="text-[10px] text-center text-[#888888] mt-2 font-mono">
                         <p className="text-[#D4FF00]">
-                          {txStep === 'idle' && 'Step 1/3: Approve collateral'}
+                          {txStep === 'approving' && 'Step 1/3: Approving collateral...'}
                           {txStep === 'approved' && 'Step 2/3: Supply collateral'}
+                          {txStep === 'supplying_collateral' && 'Step 2/3: Supplying collateral...'}
                           {txStep === 'collateral_supplied' && 'Step 3/3: Borrow UPETH'}
+                          {txStep === 'borrowing' && 'Step 3/3: Borrowing...'}
                         </p>
                       </div>
+                    )}
+
+                    {/* TX Hash Display */}
+                    {txHash && txStep !== 'idle' && (
+                      <a 
+                        href={`https://sepolia.explorer.giwa.network/tx/${txHash}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-xs text-[#D4FF00] hover:underline font-mono text-center block"
+                      >
+                        View transaction ↗
+                      </a>
                     )}
 
                     <button onClick={() => selectMarket(null)} className="w-full py-2 text-xs text-[#888888] hover:text-white transition-colors font-mono">[ Cancel ]</button>
