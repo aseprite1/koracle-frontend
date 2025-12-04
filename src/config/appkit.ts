@@ -37,7 +37,7 @@ const metadata = {
 }
 
 // Networks
-const networks = [giwaSepoliaNetwork]
+const networks: [AppKitNetwork, ...AppKitNetwork[]] = [giwaSepoliaNetwork]
 
 // Wagmi Adapter
 export const wagmiAdapter = new WagmiAdapter({
