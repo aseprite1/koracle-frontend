@@ -41,6 +41,7 @@ export const erc20Abi = [
 ] as const
 
 export const morphoAbi = [
+  // Supply loan token (UPETH)
   {
     inputs: [
       {
@@ -64,6 +65,31 @@ export const morphoAbi = [
     stateMutability: 'nonpayable',
     type: 'function'
   },
+  // Withdraw loan token (UPETH)
+  {
+    inputs: [
+      {
+        components: [
+          { name: 'loanToken', type: 'address' },
+          { name: 'collateralToken', type: 'address' },
+          { name: 'oracle', type: 'address' },
+          { name: 'irm', type: 'address' },
+          { name: 'lltv', type: 'uint256' }
+        ],
+        name: 'marketParams',
+        type: 'tuple'
+      },
+      { name: 'assets', type: 'uint256' },
+      { name: 'shares', type: 'uint256' },
+      { name: 'onBehalf', type: 'address' },
+      { name: 'receiver', type: 'address' }
+    ],
+    name: 'withdraw',
+    outputs: [{ type: 'uint256' }, { type: 'uint256' }],
+    stateMutability: 'nonpayable',
+    type: 'function'
+  },
+  // Borrow loan token (UPETH)
   {
     inputs: [
       {
@@ -87,6 +113,31 @@ export const morphoAbi = [
     stateMutability: 'nonpayable',
     type: 'function'
   },
+  // Repay loan token (UPETH)
+  {
+    inputs: [
+      {
+        components: [
+          { name: 'loanToken', type: 'address' },
+          { name: 'collateralToken', type: 'address' },
+          { name: 'oracle', type: 'address' },
+          { name: 'irm', type: 'address' },
+          { name: 'lltv', type: 'uint256' }
+        ],
+        name: 'marketParams',
+        type: 'tuple'
+      },
+      { name: 'assets', type: 'uint256' },
+      { name: 'shares', type: 'uint256' },
+      { name: 'onBehalf', type: 'address' },
+      { name: 'data', type: 'bytes' }
+    ],
+    name: 'repay',
+    outputs: [{ type: 'uint256' }, { type: 'uint256' }],
+    stateMutability: 'nonpayable',
+    type: 'function'
+  },
+  // Supply collateral (UPKRW)
   {
     inputs: [
       {
@@ -109,6 +160,30 @@ export const morphoAbi = [
     stateMutability: 'nonpayable',
     type: 'function'
   },
+  // Withdraw collateral (UPKRW)
+  {
+    inputs: [
+      {
+        components: [
+          { name: 'loanToken', type: 'address' },
+          { name: 'collateralToken', type: 'address' },
+          { name: 'oracle', type: 'address' },
+          { name: 'irm', type: 'address' },
+          { name: 'lltv', type: 'uint256' }
+        ],
+        name: 'marketParams',
+        type: 'tuple'
+      },
+      { name: 'assets', type: 'uint256' },
+      { name: 'onBehalf', type: 'address' },
+      { name: 'receiver', type: 'address' }
+    ],
+    name: 'withdrawCollateral',
+    outputs: [],
+    stateMutability: 'nonpayable',
+    type: 'function'
+  },
+  // Market data
   {
     inputs: [{ name: 'id', type: 'bytes32' }],
     name: 'market',
@@ -123,6 +198,7 @@ export const morphoAbi = [
     stateMutability: 'view',
     type: 'function'
   },
+  // User position
   {
     inputs: [
       { name: 'id', type: 'bytes32' },
