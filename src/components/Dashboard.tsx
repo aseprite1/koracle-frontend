@@ -33,6 +33,7 @@ interface LiquidatablePosition {
 const ORACLE_PRICE_SCALE = 10n ** 36n
 const WAD = 10n ** 18n
 
+
 // ============ UTILS ============
 const fmt = (n: number) => new Intl.NumberFormat('en-US').format(n)
 
@@ -45,6 +46,13 @@ const fmtCompact = (n: number): string => {
   if (n >= 100) return n.toFixed(0)
   if (n >= 1) return n.toFixed(2)
   return n.toFixed(4)
+}
+
+// Safe error logging (Security fix: no sensitive data in production)
+const logError = (context: string, error: unknown) => {
+  if (import.meta.env.DEV) {
+    console.error(context, error)
+  }
 }
 
 // ============ MAIN COMPONENT ============
@@ -101,6 +109,7 @@ export default function Dashboard() {
     functionName: 'market',
     args: [MARKET_ID],
     chainId: giwaSepoliaNetwork.id,
+    query: { refetchInterval: 5000 }, // Auto-refresh every 5 seconds
   })
 
   const { data: oraclePrice } = useReadContract({
@@ -108,6 +117,7 @@ export default function Dashboard() {
     abi: oracleAbi,
     functionName: 'price',
     chainId: giwaSepoliaNetwork.id,
+    query: { refetchInterval: 10000 }, // Auto-refresh every 10 seconds
   })
 
   const { data: kimchiPremium } = useReadContract({
@@ -115,6 +125,7 @@ export default function Dashboard() {
     abi: oracleAbi,
     functionName: 'kimchiPremium',
     chainId: giwaSepoliaNetwork.id,
+    query: { refetchInterval: 10000 },
   })
 
   const { data: upethBalanceData, refetch: refetchUpethBalance } = useReadContract({
@@ -123,6 +134,7 @@ export default function Dashboard() {
     functionName: 'balanceOf',
     args: address ? [address] : undefined,
     chainId: giwaSepoliaNetwork.id,
+    query: { refetchInterval: 5000 },
   })
 
   const { data: upkrwBalanceData, refetch: refetchUpkrwBalance } = useReadContract({
@@ -131,6 +143,7 @@ export default function Dashboard() {
     functionName: 'balanceOf',
     args: address ? [address] : undefined,
     chainId: giwaSepoliaNetwork.id,
+    query: { refetchInterval: 5000 },
   })
 
   const { data: positionData, refetch: refetchPosition } = useReadContract({
@@ -139,15 +152,48 @@ export default function Dashboard() {
     functionName: 'position',
     args: address ? [MARKET_ID, address] : undefined,
     chainId: giwaSepoliaNetwork.id,
+    query: { refetchInterval: 5000 }, // Auto-refresh every 5 seconds
   })
 
   // === Contract Writes ===
-  const { writeContract, data: txHash, reset: resetWrite } = useWriteContract()
-  const { isLoading: isTxPending, isSuccess: isTxSuccess } = useWaitForTransactionReceipt({
+  const { writeContract, data: txHash, reset: resetWrite, error: writeError } = useWriteContract()
+  const { isLoading: isTxPending, isSuccess: isTxSuccess, isError: isTxError } = useWaitForTransactionReceipt({
     hash: txHash,
   })
 
   // === Effects ===
+
+  // Handle write errors (user rejection, etc.)
+  useEffect(() => {
+    if (writeError) {
+      // Reset all transaction states on error
+      setTxStep('idle')
+      setExecutionStatus('idle')
+      setLiquidateTxStep('idle')
+      approvedCollateralRef.current = 0n
+      borrowAmountRef.current = 0n
+      resetWrite()
+      
+      // Show user-friendly error message
+      const errorMsg = writeError.message?.includes('User rejected') 
+        ? 'Transaction cancelled'
+        : 'Transaction failed'
+      setErrorMessage(errorMsg)
+      setTimeout(() => setErrorMessage(null), 3000)
+    }
+  }, [writeError, resetWrite])
+
+  // Handle transaction errors (after submission)
+  useEffect(() => {
+    if (isTxError && txHash) {
+      setTxStep('idle')
+      setExecutionStatus('idle')
+      setLiquidateTxStep('idle')
+      setErrorMessage('Transaction failed on chain')
+      setTimeout(() => setErrorMessage(null), 4000)
+      resetWrite()
+    }
+  }, [isTxError, txHash, resetWrite])
 
   // Oracle price calculation
   // oraclePrice = (1 UPKRW in UPETH) * 1e36
@@ -308,7 +354,7 @@ export default function Dashboard() {
         liquidationIncentive,
       }
     } catch (error) {
-      console.error('Error checking position:', error)
+      logError('Error checking position:', error)
       return null
     }
   }, [publicClient, oraclePrice, marketData])
@@ -335,24 +381,35 @@ export default function Dashboard() {
   }
 
   const executeLiquidation = async () => {
-    if (!selectedBorrower || !liquidateAmount || !isConnected) return
+    if (!selectedBorrower || !liquidateAmount || !isConnected || !oraclePrice) return
 
-    const seizeAmount = parseUnits(liquidateAmount, 18)
+    const repayAmount = parseUnits(liquidateAmount, 18) // UPETH to repay
     
-    // First approve UPETH for repaying debt
+    // Approve UPETH for repaying debt (2x for safety margin)
+    const approveAmount = repayAmount * 2n
+    
     setLiquidateTxStep('approving')
     writeContract({
       address: ADDRESSES.UPETH,
       abi: erc20Abi,
       functionName: 'approve',
-      args: [ADDRESSES.MORPHO, seizeAmount * 2n], // Approve extra for safety
+      args: [ADDRESSES.MORPHO, approveAmount],
     })
   }
 
   const executeLiquidationAfterApprove = async () => {
-    if (!selectedBorrower || !liquidateAmount) return
+    if (!selectedBorrower || !liquidateAmount || !oraclePrice) return
 
-    const seizeAmount = parseUnits(liquidateAmount, 18)
+    const repayAmount = parseUnits(liquidateAmount, 18) // UPETH to repay
+    
+    // Calculate collateral to seize based on repay amount
+    // seizedAssets = repayAmount * liquidationIncentive / oraclePrice * ORACLE_PRICE_SCALE
+    // We use seizedAssets=0 and repaidShares approach, or calculate seizedAssets
+    // For Morpho: if seizedAssets > 0, it calculates repaidShares from seizedAssets
+    // If repaidShares > 0, it calculates seizedAssets from repaidShares
+    // We'll specify seizedAssets based on repay amount
+    const liquidationIncentive = 105n // 1.05 in percentage (105%)
+    const seizeAmount = (repayAmount * ORACLE_PRICE_SCALE * liquidationIncentive) / (oraclePrice * 100n)
     
     setLiquidateTxStep('liquidating')
     writeContract({
@@ -473,7 +530,7 @@ export default function Dashboard() {
 
   // Execute supply flow
   const executeSupply = async () => {
-    if (!isConnected || !selection || !inputAmount) return
+    if (!isConnected || !selection || !inputAmount || !address) return
 
     try {
       const amount = parseUnits(inputAmount, 18)
@@ -510,7 +567,7 @@ export default function Dashboard() {
             address: ADDRESSES.MORPHO,
             abi: morphoAbi,
             functionName: 'borrow',
-            args: [marketParams, amount, 0n, address!, address!],
+            args: [marketParams, amount, 0n, address, address],
           })
         }
       } else {
@@ -525,14 +582,14 @@ export default function Dashboard() {
         })
       }
     } catch (error) {
-      console.error('Transaction failed:', error)
+      logError('Transaction failed:', error)
       setTxStep('idle')
     }
   }
 
   // Execute withdraw flow (no approve needed)
   const executeWithdraw = async () => {
-    if (!isConnected || !selection || !inputAmount) return
+    if (!isConnected || !selection || !inputAmount || !address) return
 
     try {
       const amount = parseUnits(inputAmount, 18)
@@ -544,7 +601,7 @@ export default function Dashboard() {
           address: ADDRESSES.MORPHO,
           abi: morphoAbi,
           functionName: 'withdraw',
-          args: [marketParams, amount, 0n, address!, address!],
+          args: [marketParams, amount, 0n, address, address],
         })
       } else if (selection === 'UPKRW') {
         // Withdraw collateral UPKRW - check Health Factor first
@@ -569,7 +626,7 @@ export default function Dashboard() {
           address: ADDRESSES.MORPHO,
           abi: morphoAbi,
           functionName: 'withdrawCollateral',
-          args: [marketParams, amount, address!, address!],
+          args: [marketParams, amount, address, address],
         })
       } else if (selection === 'UPETH_BORROW') {
         // Repay borrowed UPETH (needs approve first)
@@ -583,17 +640,17 @@ export default function Dashboard() {
         })
       }
     } catch (error) {
-      console.error('Withdraw failed:', error)
+      logError('Withdraw failed:', error)
       setTxStep('idle')
     }
   }
 
   const executeAfterApprove = async () => {
-    if (!isConnected || !selection) return
+    if (!isConnected || !selection || !address) return
 
     const amount = approvedCollateralRef.current
     if (amount === 0n) {
-      console.error('No approved amount stored')
+      logError('No approved amount stored', null)
       return
     }
 
@@ -605,7 +662,7 @@ export default function Dashboard() {
           address: ADDRESSES.MORPHO,
           abi: morphoAbi,
           functionName: 'repay',
-          args: [marketParams, amount, 0n, address!, '0x' as `0x${string}`],
+          args: [marketParams, amount, 0n, address, '0x' as `0x${string}`],
         })
       } else if (selection === 'UPETH') {
         setTxStep('executing')
@@ -613,7 +670,7 @@ export default function Dashboard() {
           address: ADDRESSES.MORPHO,
           abi: morphoAbi,
           functionName: 'supply',
-          args: [marketParams, amount, 0n, address!, '0x' as `0x${string}`],
+          args: [marketParams, amount, 0n, address, '0x' as `0x${string}`],
         })
       } else if (selection === 'UPKRW') {
         setTxStep('executing')
@@ -621,7 +678,7 @@ export default function Dashboard() {
           address: ADDRESSES.MORPHO,
           abi: morphoAbi,
           functionName: 'supplyCollateral',
-          args: [marketParams, amount, address!, '0x' as `0x${string}`],
+          args: [marketParams, amount, address, '0x' as `0x${string}`],
         })
       } else if (selection === 'UPETH_BORROW') {
         setTxStep('supplying_collateral')
@@ -629,22 +686,22 @@ export default function Dashboard() {
           address: ADDRESSES.MORPHO,
           abi: morphoAbi,
           functionName: 'supplyCollateral',
-          args: [marketParams, amount, address!, '0x' as `0x${string}`],
+          args: [marketParams, amount, address, '0x' as `0x${string}`],
         })
       }
     } catch (error) {
-      console.error('Execute failed:', error)
+      logError('Execute failed:', error)
       setTxStep('idle')
       setExecutionStatus('idle')
     }
   }
 
   const executeBorrow = async () => {
-    if (!isConnected || selection !== 'UPETH_BORROW') return
+    if (!isConnected || selection !== 'UPETH_BORROW' || !address) return
 
     const borrowAmount = borrowAmountRef.current
     if (borrowAmount === 0n) {
-      console.error('No borrow amount stored')
+      logError('No borrow amount stored', null)
       return
     }
 
@@ -658,7 +715,7 @@ export default function Dashboard() {
         args: [marketParams, borrowAmount, 0n, address!, address!],
       })
     } catch (error) {
-      console.error('Borrow failed:', error)
+      logError('Borrow failed:', error)
       setTxStep('idle')
       setExecutionStatus('idle')
     }
@@ -1175,8 +1232,8 @@ export default function Dashboard() {
 
                         <div className="mb-6">
                           <div className="flex justify-between font-mono text-[10px] text-[#888888] mb-2 uppercase">
-                            <label>Collateral to Seize (UPKRW)</label>
-                            <span>Max: {fmtCompact(Number(selectedBorrower.collateral) / 1e18)}</span>
+                            <label>Debt to Repay (UPETH)</label>
+                            <span>Max Debt: {selectedBorrower.borrowAssets.toFixed(4)} UPETH</span>
                           </div>
                           <div className="flex gap-2">
                             <input
@@ -1188,7 +1245,7 @@ export default function Dashboard() {
                               className="flex-1 bg-transparent border border-white/20 px-4 py-3 font-mono text-xl text-white focus:outline-none focus:border-[#FF6B6B] placeholder-white/30"
                             />
                             <button 
-                              onClick={() => setLiquidateAmount((Number(selectedBorrower.collateral) / 1e18).toString())}
+                              onClick={() => setLiquidateAmount(selectedBorrower.borrowAssets.toFixed(6))}
                               className="px-4 bg-white/10 hover:bg-white/20 text-white font-mono text-xs uppercase transition-colors"
                             >
                               MAX
@@ -1202,16 +1259,16 @@ export default function Dashboard() {
                             <span className="font-mono text-[#D4FF00]">+5%</span>
                           </div>
                           <div className="flex justify-between text-sm">
-                            <span className="font-mono text-[#888888]">You Repay (UPETH)</span>
-                            <span className="font-mono text-white">
-                              ~{liquidateAmount ? (parseFloat(liquidateAmount) / ethPrice * 0.95).toFixed(6) : '0'} UPETH
+                            <span className="font-mono text-[#888888]">You Receive (UPKRW)</span>
+                            <span className="font-mono text-[#D4FF00]">
+                              ~{liquidateAmount ? fmtCompact(parseFloat(liquidateAmount) * ethPrice * 1.05) : '0'} UPKRW
                             </span>
                           </div>
                         </div>
 
                         <button
                           onClick={executeLiquidation}
-                          disabled={!liquidateAmount || liquidateTxStep !== 'idle' || !isConnected}
+                          disabled={!liquidateAmount || liquidateTxStep !== 'idle' || !isConnected || !oraclePrice}
                           className="w-full py-4 bg-[#FF6B6B] text-white font-mono font-bold uppercase tracking-wider hover:bg-red-400 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                         >
                           {liquidateTxStep === 'approving' ? 'Approving...' : 
@@ -1444,7 +1501,7 @@ export default function Dashboard() {
                     {/* TX Hash Display */}
                     {txHash && txStep !== 'idle' && (
                       <a 
-                        href={`https://sepolia.explorer.giwa.network/tx/${txHash}`}
+                        href={`https://sepolia-explorer.giwa.io/tx/${txHash}`}
                         target="_blank"
                         rel="noopener noreferrer"
                         className="text-xs text-[#D4FF00] hover:underline font-mono text-center block"
