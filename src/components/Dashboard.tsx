@@ -98,6 +98,14 @@ export default function Dashboard() {
 
   // Error State (replaces alert())
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
+  
+  // Toast message for general notifications
+  const [toastMessage, setToastMessage] = useState<string | null>(null)
+  
+  const showToast = (message: string) => {
+    setToastMessage(message)
+    setTimeout(() => setToastMessage(null), 2000)
+  }
 
   // Public client for reading positions
   const publicClient = usePublicClient({ chainId: giwaSepoliaNetwork.id })
@@ -892,7 +900,7 @@ export default function Dashboard() {
           <div className="hidden md:flex items-center space-x-8 text-sm font-medium text-[#888888] font-mono">
             <button onClick={() => navigate('dashboard')} className={`hover:text-[#D4FF00] transition-colors ${currentView === 'dashboard' ? 'text-white' : ''}`}>PROTOCOL</button>
             <button onClick={() => navigate('liquidate')} className={`hover:text-[#D4FF00] transition-colors ${currentView === 'liquidate' ? 'text-white' : ''}`}>LIQUIDATION <span className="text-[10px] text-[#FF6B6B] align-top ml-0.5">●</span></button>
-            <button className="hover:text-[#D4FF00] transition-colors">DOCS</button>
+            <button onClick={() => showToast('Docs coming soon!')} className="hover:text-[#D4FF00] transition-colors">DOCS</button>
           </div>
 
           <div className="flex items-center space-x-4">
@@ -905,6 +913,15 @@ export default function Dashboard() {
             </div>
             <appkit-button />
           </div>
+
+        {/* Disclaimer Banner */}
+        {!isConnected && (
+          <div className="absolute top-16 left-0 right-0 bg-[#1a1a00] border-b border-[#D4FF00]/30 px-4 py-2 text-center z-30">
+            <span className="text-[11px] text-[#D4FF00]/80 font-mono">
+              TESTNET ONLY - This is a demo on GIWA Sepolia. Do not use real funds or wallets.
+            </span>
+          </div>
+        )}
         </nav>
 
         {/* Main Layout */}
@@ -1346,13 +1363,11 @@ export default function Dashboard() {
 
                   {/* Asset Info */}
                   <div className="flex items-center space-x-4 mb-8">
-                    <div className="w-12 h-12 flex items-center justify-center border border-white/10 rounded-full bg-white/5">
-                      {getPanelAsset() === 'UPETH' ? (
-                        <svg className="w-8 h-8" viewBox="0 0 32 32"><g fill="none" fillRule="evenodd"><circle cx="16" cy="16" r="16" fill="#627EEA"/><path fill="#FFF" fillOpacity=".602" d="M16.498 4v8.87l7.497 3.35z"/><path fill="#FFF" d="M16.498 4L9 16.22l7.498-3.35z"/></g></svg>
-                      ) : (
-                        <div className="w-8 h-8 rounded-full bg-gradient-to-br from-red-500 to-blue-600 flex items-center justify-center text-xs font-bold text-white">₩</div>
-                      )}
-                    </div>
+                    {getPanelAsset() === 'UPETH' ? (
+                      <svg className="w-10 h-10 flex-shrink-0" viewBox="0 0 32 32"><g fill="none" fillRule="evenodd"><circle cx="16" cy="16" r="16" fill="#627EEA"/><path fill="#FFF" fillOpacity=".602" d="M16.498 4v8.87l7.497 3.35z"/><path fill="#FFF" d="M16.498 4L9 16.22l7.498-3.35z"/><path fill="#FFF" fillOpacity=".602" d="M16.498 21.968l7.497-4.353-7.497-3.348z"/><path fill="#FFF" d="M9 17.615l7.498 4.353v-7.701z"/><path fill="#FFF" fillOpacity=".2" d="M16.498 20.573l7.497-4.353-7.497 10.291z"/><path fill="#FFF" fillOpacity=".602" d="M9 16.22l7.498 4.353v1.791z"/></g></svg>
+                    ) : (
+                      <div className="w-10 h-10 flex-shrink-0 rounded-full bg-gradient-to-br from-red-500 to-blue-600 flex items-center justify-center text-sm font-bold text-white border border-white/10">₩</div>
+                    )}
                     <div>
                       <h4 className="font-bold text-xl">{getPanelAsset()}</h4>
                       <div className="text-[10px] font-mono text-[#888888] uppercase tracking-widest">{getPanelAsset() === 'UPETH' ? 'Ethereum' : 'KRW Stablecoin'}</div>
@@ -1517,6 +1532,13 @@ export default function Dashboard() {
             </div>
           </aside>
         </main>
+
+        {/* Toast Notification */}
+        {toastMessage && (
+          <div className="fixed top-20 left-1/2 -translate-x-1/2 z-50 bg-white/10 backdrop-blur-sm border border-white/20 px-6 py-3 rounded-sm fade-in">
+            <span className="font-mono text-sm text-white">{toastMessage}</span>
+          </div>
+        )}
       </div>
     </>
   )

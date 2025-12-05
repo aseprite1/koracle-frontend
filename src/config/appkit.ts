@@ -22,8 +22,8 @@ export const giwaSepoliaNetwork = {
   testnet: true,
 } as const satisfies AppKitNetwork
 
-// Project ID from Reown Dashboard
-export const projectId = '51a18daee71282dd511b5b7b65cc904e'
+// Project ID from Reown Dashboard (via environment variable)
+export const projectId = import.meta.env.VITE_REOWN_PROJECT_ID || ''
 
 // Query client for React Query
 export const queryClient = new QueryClient()
@@ -58,11 +58,17 @@ createAppKit({
     socials: [],
     swaps: false,
     onramp: false,
+    emailShowWallets: false,
   },
+  enableWalletGuide: false,
   themeMode: 'dark',
   themeVariables: {
     '--w3m-accent': '#D4FF00',
     '--w3m-color-mix': '#000000',
     '--w3m-border-radius-master': '0px',
+  },
+  // Custom chain icon for GIWA Sepolia (fixes loading spinner)
+  chainImages: {
+    91342: '/giwa-logo.png'
   }
 })
