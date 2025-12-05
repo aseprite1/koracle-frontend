@@ -5,6 +5,7 @@ export const ADDRESSES = {
   UPKRW: '0x159C54accF62C14C117474B67D2E3De8215F5A72',
   ORACLE: '0x258d90F00eEd27c69514A934379Aa41Cc03ea875',
   IRM: '0xA99676204e008B511dA8662F9bE99e2bfA5afd63',
+  FAUCET: '0xF41830489d6DA54Fc9BcB387bF57E5fb47EdE95a',
 } as const
 
 export const MARKET_ID = '0x5fdc9fa54b964034b39b1b36ec4b8b009bbf1448cdc951cbb05f647c42d9149f' as const
@@ -259,5 +260,65 @@ export const oracleAbi = [
     outputs: [{ type: 'uint256' }],
     stateMutability: 'view',
     type: 'function'
+  },
+] as const
+
+export const faucetAbi = [
+  {
+    inputs: [],
+    name: 'claim',
+    outputs: [],
+    stateMutability: 'nonpayable',
+    type: 'function'
+  },
+  {
+    inputs: [{ name: 'account', type: 'address' }],
+    name: 'hasClaimed',
+    outputs: [{ type: 'bool' }],
+    stateMutability: 'view',
+    type: 'function'
+  },
+  {
+    inputs: [],
+    name: 'getRemainingBalance',
+    outputs: [
+      { name: 'upkrwBalance', type: 'uint256' },
+      { name: 'upethBalance', type: 'uint256' }
+    ],
+    stateMutability: 'view',
+    type: 'function'
+  },
+  {
+    inputs: [],
+    name: 'UPKRW_AMOUNT',
+    outputs: [{ type: 'uint256' }],
+    stateMutability: 'view',
+    type: 'function'
+  },
+  {
+    inputs: [],
+    name: 'UPETH_AMOUNT',
+    outputs: [{ type: 'uint256' }],
+    stateMutability: 'view',
+    type: 'function'
+  },
+  {
+    anonymous: false,
+    inputs: [
+      { indexed: true, name: 'user', type: 'address' },
+      { indexed: false, name: 'upkrwAmount', type: 'uint256' },
+      { indexed: false, name: 'upethAmount', type: 'uint256' }
+    ],
+    name: 'Claimed',
+    type: 'event'
+  },
+  {
+    anonymous: false,
+    inputs: [
+      { indexed: true, name: 'token', type: 'address' },
+      { indexed: false, name: 'amount', type: 'uint256' }
+    ],
+    name: 'Withdrawn',
+    type: 'event'
   },
 ] as const

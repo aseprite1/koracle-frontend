@@ -1,11 +1,11 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useAccount, useReadContract, useWriteContract, useWaitForTransactionReceipt, usePublicClient } from 'wagmi'
 import { formatUnits, parseUnits } from 'viem'
-import { ADDRESSES, MARKET_ID, morphoAbi, oracleAbi, erc20Abi, marketParams, liquidateAbi } from '../config/contracts'
+import { ADDRESSES, MARKET_ID, morphoAbi, oracleAbi, erc20Abi, marketParams, liquidateAbi, faucetAbi } from '../config/contracts'
 import { giwaSepoliaNetwork } from '../config/appkit'
 
 // ============ TYPES ============
-type ViewType = 'dashboard' | 'liquidate'
+type ViewType = 'dashboard' | 'liquidate' | 'faucet'
 type MarketSelection = 'UPETH' | 'UPKRW' | 'UPETH_BORROW' | null
 type ActionMode = 'supply' | 'withdraw'
 
@@ -96,6 +96,9 @@ export default function Dashboard() {
   const [liquidateAmount, setLiquidateAmount] = useState('')
   const [liquidateTxStep, setLiquidateTxStep] = useState<'idle' | 'approving' | 'liquidating'>('idle')
 
+  // Faucet State
+  const [faucetTxStep, setFaucetTxStep] = useState<'idle' | 'claiming' | 'claimed'>('idle')
+
   // Error State (replaces alert())
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   
@@ -161,6 +164,23 @@ export default function Dashboard() {
     args: address ? [MARKET_ID, address] : undefined,
     chainId: giwaSepoliaNetwork.id,
     query: { refetchInterval: 5000 }, // Auto-refresh every 5 seconds
+  })
+
+  // Faucet data
+  const { data: hasClaimedData, refetch: refetchHasClaimed } = useReadContract({
+    address: ADDRESSES.FAUCET,
+    abi: faucetAbi,
+    functionName: 'hasClaimed',
+    args: address ? [address] : undefined,
+    chainId: giwaSepoliaNetwork.id,
+  })
+
+  const { data: faucetBalanceData } = useReadContract({
+    address: ADDRESSES.FAUCET,
+    abi: faucetAbi,
+    functionName: 'getRemainingBalance',
+    chainId: giwaSepoliaNetwork.id,
+    query: { refetchInterval: 10000 },
   })
 
   // === Contract Writes ===
@@ -264,9 +284,23 @@ export default function Dashboard() {
             resetWrite()
           }, 1500)
         })
+      } else if (faucetTxStep === 'claiming') {
+        // Faucet claim success
+        setFaucetTxStep('claimed')
+        showToast('Tokens claimed successfully!')
+        Promise.all([
+          refetchHasClaimed(),
+          refetchUpethBalance(),
+          refetchUpkrwBalance()
+        ]).then(() => {
+          setTimeout(() => {
+            setFaucetTxStep('idle')
+            resetWrite()
+          }, 1500)
+        })
       }
     }
-  }, [isTxSuccess, txStep, refetchPosition, refetchUpethBalance, refetchUpkrwBalance, refetchMarket, resetWrite])
+  }, [isTxSuccess, txStep, faucetTxStep, refetchPosition, refetchUpethBalance, refetchUpkrwBalance, refetchMarket, refetchHasClaimed, resetWrite, showToast])
 
   useEffect(() => {
     if (positionData && marketData) {
@@ -900,6 +934,7 @@ export default function Dashboard() {
           <div className="hidden md:flex items-center space-x-8 text-sm font-medium text-[#888888] font-mono">
             <button onClick={() => navigate('dashboard')} className={`hover:text-[#D4FF00] transition-colors ${currentView === 'dashboard' ? 'text-white' : ''}`}>PROTOCOL</button>
             <button onClick={() => navigate('liquidate')} className={`hover:text-[#D4FF00] transition-colors ${currentView === 'liquidate' ? 'text-white' : ''}`}>LIQUIDATION <span className="text-[10px] text-[#FF6B6B] align-top ml-0.5">●</span></button>
+            <button onClick={() => navigate('faucet')} className={`hover:text-[#D4FF00] transition-colors ${currentView === 'faucet' ? 'text-white' : ''}`}>FAUCET <span className="text-[10px] text-[#D4FF00] align-top ml-0.5">●</span></button>
             <button onClick={() => showToast('Docs coming soon!')} className="hover:text-[#D4FF00] transition-colors">DOCS</button>
           </div>
 
@@ -1315,6 +1350,118 @@ export default function Dashboard() {
                             <div className="font-mono text-sm text-white mb-1">Kimchi Premium Risk</div>
                             <p className="font-mono text-xs text-[#888888] leading-relaxed">
                               High kimchi premium ({kimchi.toFixed(1)}%) increases liquidation risk as oracle price may move against borrowers.
+                            </p>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Faucet View */}
+                {currentView === 'faucet' && (
+                  <div className="fade-in space-y-8">
+                    {/* Faucet Header */}
+                    <div className="border-b border-white/10 pb-6">
+                      <h1 className="font-serif italic text-4xl mb-2">Test Token Faucet</h1>
+                      <p className="font-mono text-xs text-[#888888] max-w-lg">
+                        Claim free test tokens to try out the protocol. One claim per wallet address.
+                      </p>
+                    </div>
+
+                    {/* Faucet Card */}
+                    <div className="max-w-xl mx-auto">
+                      <div className="border border-[#D4FF00]/30 bg-[#D4FF00]/5 p-8">
+                        <div className="text-center mb-8">
+                          <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-[#D4FF00]/10 border border-[#D4FF00]/30 mb-4">
+                            <span className="material-symbols-outlined text-[#D4FF00] text-3xl">water_drop</span>
+                          </div>
+                          <h2 className="font-mono text-xl text-white mb-2">Claim Test Tokens</h2>
+                          <p className="font-mono text-xs text-[#888888]">
+                            Receive tokens instantly to your connected wallet
+                          </p>
+                        </div>
+
+                        {/* Token Amounts */}
+                        <div className="grid grid-cols-2 gap-4 mb-8">
+                          <div className="p-4 border border-white/10 bg-white/[0.02] text-center">
+                            <div className="flex items-center justify-center space-x-2 mb-2">
+                              <svg className="w-6 h-6" viewBox="0 0 32 32"><g fill="none" fillRule="evenodd"><circle cx="16" cy="16" r="16" fill="#627EEA"/><path fill="#FFF" fillOpacity=".602" d="M16.498 4v8.87l7.497 3.35z"/><path fill="#FFF" d="M16.498 4L9 16.22l7.498-3.35z"/></g></svg>
+                              <span className="font-mono text-sm text-[#888888]">UPETH</span>
+                            </div>
+                            <div className="font-mono text-2xl text-[#D4FF00]">10</div>
+                          </div>
+                          <div className="p-4 border border-white/10 bg-white/[0.02] text-center">
+                            <div className="flex items-center justify-center space-x-2 mb-2">
+                              <div className="w-6 h-6 rounded-full bg-gradient-to-br from-red-500 to-blue-600 flex items-center justify-center text-[10px] font-bold text-white">₩</div>
+                              <span className="font-mono text-sm text-[#888888]">UPKRW</span>
+                            </div>
+                            <div className="font-mono text-2xl text-[#D4FF00]">50,000,000</div>
+                          </div>
+                        </div>
+
+                        {/* Claim Button */}
+                        {!isConnected ? (
+                          <div className="text-center p-4 border border-white/10 bg-white/[0.02]">
+                            <span className="font-mono text-sm text-[#888888]">Connect wallet to claim tokens</span>
+                          </div>
+                        ) : hasClaimedData ? (
+                          <div className="text-center p-4 border border-green-500/30 bg-green-500/10">
+                            <span className="material-symbols-outlined text-green-400 text-2xl mb-2">check_circle</span>
+                            <div className="font-mono text-sm text-green-400">Already Claimed</div>
+                            <p className="font-mono text-xs text-[#888888] mt-1">You have already received test tokens</p>
+                          </div>
+                        ) : (
+                          <button
+                            onClick={async () => {
+                              if (!address) return
+                              setFaucetTxStep('claiming')
+                              try {
+                                writeContract({
+                                  address: ADDRESSES.FAUCET,
+                                  abi: faucetAbi,
+                                  functionName: 'claim',
+                                })
+                              } catch (err) {
+                                logError('Faucet claim error:', err)
+                                setFaucetTxStep('idle')
+                              }
+                            }}
+                            disabled={faucetTxStep === 'claiming' || isTxPending}
+                            className="w-full py-4 bg-[#D4FF00] text-black font-mono font-bold uppercase tracking-wider hover:bg-[#c4ef00] disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                          >
+                            {faucetTxStep === 'claiming' || isTxPending ? 'Claiming...' : 'Claim Tokens'}
+                          </button>
+                        )}
+
+                        {/* Faucet Balance Info */}
+                        <div className="mt-6 pt-6 border-t border-white/10">
+                          <div className="font-mono text-[10px] uppercase text-[#888888] mb-3">Faucet Remaining Balance</div>
+                          <div className="grid grid-cols-2 gap-4 text-center">
+                            <div>
+                              <div className="font-mono text-sm text-white">
+                                {faucetBalanceData ? Number(formatUnits(faucetBalanceData[1] as bigint, 18)).toLocaleString() : '-'}
+                              </div>
+                              <div className="font-mono text-[10px] text-[#888888]">UPETH</div>
+                            </div>
+                            <div>
+                              <div className="font-mono text-sm text-white">
+                                {faucetBalanceData ? Number(formatUnits(faucetBalanceData[0] as bigint, 18)).toLocaleString() : '-'}
+                              </div>
+                              <div className="font-mono text-[10px] text-[#888888]">UPKRW</div>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Info */}
+                      <div className="mt-6 p-4 border border-white/10 bg-white/[0.02]">
+                        <div className="flex items-start space-x-3">
+                          <span className="material-symbols-outlined text-[#D4FF00]">info</span>
+                          <div>
+                            <div className="font-mono text-sm text-white mb-1">Test Tokens Only</div>
+                            <p className="font-mono text-xs text-[#888888] leading-relaxed">
+                              These tokens have no real value and are for testing purposes only on GIWA Sepolia testnet.
                             </p>
                           </div>
                         </div>
