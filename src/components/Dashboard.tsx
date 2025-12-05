@@ -71,6 +71,7 @@ export default function Dashboard() {
 
   const approvedCollateralRef = useRef<bigint>(0n)
   const borrowAmountRef = useRef<bigint>(0n)
+  const isFullRepayRef = useRef<boolean>(false)
 
   // Market State
   const [ethPrice, setEthPrice] = useState(4566000)
@@ -94,7 +95,8 @@ export default function Dashboard() {
   const [isLoadingPositions, setIsLoadingPositions] = useState(false)
   const [selectedBorrower, setSelectedBorrower] = useState<LiquidatablePosition | null>(null)
   const [liquidateAmount, setLiquidateAmount] = useState('')
-  const [liquidateTxStep, setLiquidateTxStep] = useState<'idle' | 'approving' | 'liquidating'>('idle')
+  const [liquidateTxStep, setLiquidateTxStep] = useState<'idle' | 'approving' | 'liquidating' | 'success'>('idle')
+  const [liquidateTxHash, setLiquidateTxHash] = useState<string | null>(null)
 
   // Faucet State
   const [faucetTxStep, setFaucetTxStep] = useState<'idle' | 'claiming' | 'claimed'>('idle')
@@ -200,6 +202,7 @@ export default function Dashboard() {
       setLiquidateTxStep('idle')
       approvedCollateralRef.current = 0n
       borrowAmountRef.current = 0n
+      isFullRepayRef.current = false
       resetWrite()
       
       // Show user-friendly error message
@@ -281,6 +284,7 @@ export default function Dashboard() {
             setSimulatedHF(null)
             approvedCollateralRef.current = 0n
             borrowAmountRef.current = 0n
+            isFullRepayRef.current = false
             resetWrite()
           }, 1500)
         })
@@ -426,9 +430,10 @@ export default function Dashboard() {
     if (!selectedBorrower || !liquidateAmount || !isConnected || !oraclePrice) return
 
     const repayAmount = parseUnits(liquidateAmount, 18) // UPETH to repay
+    const maxDebt = parseUnits(selectedBorrower.borrowAssets.toString(), 18)
     
-    // Approve UPETH for repaying debt (2x for safety margin)
-    const approveAmount = repayAmount * 2n
+    // Cap approve to actual debt amount (with small margin for interest)
+    const approveAmount = repayAmount > maxDebt ? maxDebt + (maxDebt / 100n) : repayAmount + (repayAmount / 100n)
     
     setLiquidateTxStep('approving')
     writeContract({
@@ -442,16 +447,41 @@ export default function Dashboard() {
   const executeLiquidationAfterApprove = async () => {
     if (!selectedBorrower || !liquidateAmount || !oraclePrice) return
 
-    const repayAmount = parseUnits(liquidateAmount, 18) // UPETH to repay
+    // Fetch fresh position data before liquidating
+    const freshPosition = await checkBorrowerPosition(selectedBorrower.borrower)
+    if (!freshPosition) {
+      setErrorMessage('Failed to fetch position data')
+      setLiquidateTxStep('idle')
+      return
+    }
+
+    let repayAmount = parseUnits(liquidateAmount, 18) // UPETH to repay
+    const maxRepayAmount = parseUnits(freshPosition.borrowAssets.toString(), 18)
+    
+    // Cap repayAmount to borrower's actual debt to prevent underflow
+    if (repayAmount > maxRepayAmount) {
+      repayAmount = maxRepayAmount
+    }
     
     // Calculate collateral to seize based on repay amount
     // seizedAssets = repayAmount * liquidationIncentive / oraclePrice * ORACLE_PRICE_SCALE
-    // We use seizedAssets=0 and repaidShares approach, or calculate seizedAssets
-    // For Morpho: if seizedAssets > 0, it calculates repaidShares from seizedAssets
-    // If repaidShares > 0, it calculates seizedAssets from repaidShares
-    // We'll specify seizedAssets based on repay amount
     const liquidationIncentive = 105n // 1.05 in percentage (105%)
-    const seizeAmount = (repayAmount * ORACLE_PRICE_SCALE * liquidationIncentive) / (oraclePrice * 100n)
+    let seizeAmount = (repayAmount * ORACLE_PRICE_SCALE * liquidationIncentive) / (oraclePrice * 100n)
+    
+    // Cap seizeAmount to borrower's actual collateral to prevent overflow
+    if (seizeAmount > freshPosition.collateral) {
+      seizeAmount = freshPosition.collateral
+    }
+
+    // Also check if trying to seize more than what exists
+    if (seizeAmount === 0n) {
+      setErrorMessage('No collateral to seize')
+      setLiquidateTxStep('idle')
+      return
+    }
+
+    // Apply 95% safety margin to avoid edge case overflows in contract
+    seizeAmount = (seizeAmount * 95n) / 100n
     
     setLiquidateTxStep('liquidating')
     writeContract({
@@ -470,8 +500,11 @@ export default function Dashboard() {
       // Save borrower address BEFORE clearing state (fix stale closure)
       const borrowerAddress = selectedBorrower?.borrower
       
-      // Reset UI state
-      setLiquidateTxStep('idle')
+      // Save tx hash and show success
+      if (txHash) {
+        setLiquidateTxHash(txHash)
+      }
+      setLiquidateTxStep('success')
       setSelectedBorrower(null)
       setLiquidateAmount('')
       
@@ -523,6 +556,7 @@ export default function Dashboard() {
     setExecutionStatus('idle')
     approvedCollateralRef.current = 0n
     borrowAmountRef.current = 0n
+    isFullRepayRef.current = false
   }
 
   const calculateHealthFactor = (newBorrowETH: number, newCollateralKRW: number): number | null => {
@@ -646,39 +680,87 @@ export default function Dashboard() {
           args: [marketParams, amount, 0n, address, address],
         })
       } else if (selection === 'UPKRW') {
-        // Withdraw collateral UPKRW - check Health Factor first
-        if (userPosition.borrowAssets > 0 && oraclePrice) {
-          const remainingCollateral = userPosition.collateral - amount
-          if (remainingCollateral < 0n) {
-            setErrorMessage('인출 금액이 담보보다 큽니다')
-            setTimeout(() => setErrorMessage(null), 4000)
-            return
-          }
-          const existingBorrow = parseUnits(userPosition.borrowAssets.toString(), 18)
-          const lltv = marketParams.lltv
-          const maxBorrow = (remainingCollateral * oraclePrice * lltv) / (ORACLE_PRICE_SCALE * WAD)
-          if (existingBorrow > maxBorrow) {
-            setErrorMessage('Health Factor가 1 미만이 됩니다. 먼저 대출을 상환하세요.')
-            setTimeout(() => setErrorMessage(null), 4000)
-            return
+        // Withdraw collateral UPKRW
+        // Fetch fresh position to get actual collateral amount
+        setTxStep('executing')
+        
+        const freshPosition = await publicClient?.readContract({
+          address: ADDRESSES.MORPHO,
+          abi: morphoAbi,
+          functionName: 'position',
+          args: [MARKET_ID, address],
+        })
+        
+        if (!freshPosition) {
+          setErrorMessage('Failed to fetch position')
+          setTxStep('idle')
+          return
+        }
+        
+        const [, freshBorrowShares, freshCollateral] = freshPosition
+        
+        // Cap amount to actual collateral to handle floating point precision issues
+        let withdrawAmount = amount
+        
+        // If borrowShares > 0, cannot withdraw all collateral
+        if (BigInt(freshBorrowShares) > 0n && withdrawAmount >= freshCollateral) {
+          setErrorMessage('부채가 남아있어서 담보를 전부 뺄 수 없습니다. 먼저 부채를 전액 상환하세요.')
+          setTxStep('idle')
+          return
+        }
+        
+        // Cap to actual collateral if trying to withdraw more
+        if (withdrawAmount > freshCollateral) {
+          withdrawAmount = freshCollateral
+        }
+        
+        if (withdrawAmount === 0n) {
+          setErrorMessage('No collateral to withdraw')
+          setTxStep('idle')
+          return
+        }
+        
+        // Only check HF if borrow is significant
+        if (BigInt(freshBorrowShares) > 0n && oraclePrice && marketData) {
+          const totalBorrowAssets = marketData[2]
+          const totalBorrowShares = marketData[3]
+          const borrowAssets = BigInt(freshBorrowShares) * totalBorrowAssets / totalBorrowShares
+          
+          // Skip HF check if borrow is dust (< 0.0001 UPETH)
+          if (borrowAssets > parseUnits('0.0001', 18)) {
+            const remainingCollateral = freshCollateral - withdrawAmount
+            const lltv = marketParams.lltv
+            const maxBorrow = (remainingCollateral * oraclePrice * lltv) / (ORACLE_PRICE_SCALE * WAD)
+            if (borrowAssets > maxBorrow) {
+              setErrorMessage('Health Factor가 1 미만이 됩니다. 먼저 대출을 상환하세요.')
+              setTimeout(() => setErrorMessage(null), 4000)
+              setTxStep('idle')
+              return
+            }
           }
         }
-        setTxStep('executing')
+        
         writeContract({
           address: ADDRESSES.MORPHO,
           abi: morphoAbi,
           functionName: 'withdrawCollateral',
-          args: [marketParams, amount, address, address],
+          args: [marketParams, withdrawAmount, address, address],
         })
       } else if (selection === 'UPETH_BORROW') {
         // Repay borrowed UPETH (needs approve first)
+        // Check if this is a full repay (to use shares-based repay for clean zero)
+        const borrowAssetsWei = parseUnits(userPosition.borrowAssets.toFixed(18), 18)
+        isFullRepayRef.current = amount >= borrowAssetsWei
+        
+        // For full repay, approve a bit extra to cover any accrued interest
+        const approveAmount = isFullRepayRef.current ? amount + (amount / 100n) : amount
         approvedCollateralRef.current = amount
         setTxStep('approving')
         writeContract({
           address: ADDRESSES.UPETH,
           abi: erc20Abi,
           functionName: 'approve',
-          args: [ADDRESSES.MORPHO, amount],
+          args: [ADDRESSES.MORPHO, approveAmount],
         })
       }
     } catch (error) {
@@ -700,12 +782,25 @@ export default function Dashboard() {
       if (actionMode === 'withdraw' && selection === 'UPETH_BORROW') {
         // Repay borrowed UPETH
         setTxStep('executing')
-        writeContract({
-          address: ADDRESSES.MORPHO,
-          abi: morphoAbi,
-          functionName: 'repay',
-          args: [marketParams, amount, 0n, address, '0x' as `0x${string}`],
-        })
+        
+        if (isFullRepayRef.current) {
+          // Full repay: use shares-based repay for clean zero (no dust)
+          // repay(marketParams, 0, shares, onBehalf, data) - assets=0 means use shares
+          writeContract({
+            address: ADDRESSES.MORPHO,
+            abi: morphoAbi,
+            functionName: 'repay',
+            args: [marketParams, 0n, userPosition.borrowShares, address, '0x' as `0x${string}`],
+          })
+        } else {
+          // Partial repay: use assets-based repay
+          writeContract({
+            address: ADDRESSES.MORPHO,
+            abi: morphoAbi,
+            functionName: 'repay',
+            args: [marketParams, amount, 0n, address, '0x' as `0x${string}`],
+          })
+        }
       } else if (selection === 'UPETH') {
         setTxStep('executing')
         writeContract({
@@ -1040,7 +1135,7 @@ export default function Dashboard() {
                         <div className={`p-5 border bg-white/[0.02] ${currentHF === null ? 'border-white/10' : currentHF < 1.0 ? 'border-red-500/50 bg-red-500/10' : currentHF < 1.1 ? 'border-orange-500/50 bg-orange-500/10' : currentHF < 1.5 ? 'border-yellow-500/50 bg-yellow-500/10' : 'border-green-500/50 bg-green-500/10'}`}>
                           <div className="font-mono text-[10px] uppercase text-[#888888] mb-2">Health Factor</div>
                           <div className={`text-2xl font-mono ${currentHF === null ? 'text-[#888888]' : currentHF < 1.0 ? 'text-red-500' : currentHF < 1.1 ? 'text-orange-500' : currentHF < 1.5 ? 'text-yellow-500' : 'text-green-400'}`}>
-                            {currentHF !== null ? currentHF.toFixed(2) : '∞'}
+                            {currentHF !== null ? (currentHF > 10 ? '>10' : currentHF.toFixed(2)) : '∞'}
                           </div>
                           <div className="text-xs text-[#888888] mt-1">{currentHF !== null && currentHF < 1.1 ? 'At Risk!' : 'Safe'}</div>
                         </div>
@@ -1318,15 +1413,40 @@ export default function Dashboard() {
                           </div>
                         </div>
 
-                        <button
-                          onClick={executeLiquidation}
-                          disabled={!liquidateAmount || liquidateTxStep !== 'idle' || !isConnected || !oraclePrice}
-                          className="w-full py-4 bg-[#FF6B6B] text-white font-mono font-bold uppercase tracking-wider hover:bg-red-400 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                        >
-                          {liquidateTxStep === 'approving' ? 'Approving...' : 
-                           liquidateTxStep === 'liquidating' ? 'Liquidating...' : 
-                           'Execute Liquidation'}
-                        </button>
+                        {liquidateTxStep === 'success' ? (
+                          <div className="space-y-3">
+                            <div className="p-4 border border-green-500/30 bg-green-500/10 text-center">
+                              <span className="material-symbols-outlined text-green-400 text-2xl">check_circle</span>
+                              <div className="font-mono text-sm text-green-400 mt-2">Liquidation Successful!</div>
+                            </div>
+                            {liquidateTxHash && (
+                              <a
+                                href={`https://sepolia-explorer.giwa.io/tx/${liquidateTxHash}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="block w-full py-3 text-center text-[#D4FF00] border border-[#D4FF00]/30 font-mono text-sm hover:bg-[#D4FF00]/10 transition-colors"
+                              >
+                                View Transaction ↗
+                              </a>
+                            )}
+                            <button
+                              onClick={() => { setLiquidateTxStep('idle'); setLiquidateTxHash(null); }}
+                              className="w-full py-2 text-xs text-[#888888] hover:text-white transition-colors font-mono"
+                            >
+                              [ New Liquidation ]
+                            </button>
+                          </div>
+                        ) : (
+                          <button
+                            onClick={executeLiquidation}
+                            disabled={!liquidateAmount || liquidateTxStep !== 'idle' || !isConnected || !oraclePrice}
+                            className="w-full py-4 bg-[#FF6B6B] text-white font-mono font-bold uppercase tracking-wider hover:bg-red-400 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                          >
+                            {liquidateTxStep === 'approving' ? 'Approving...' : 
+                             liquidateTxStep === 'liquidating' ? 'Liquidating...' : 
+                             'Execute Liquidation'}
+                          </button>
+                        )}
                       </div>
                     )}
 
@@ -1500,10 +1620,10 @@ export default function Dashboard() {
                 <div className="fade-in h-full flex flex-col pt-2">
                   {/* Action Mode Toggle */}
                   <div className="flex mb-6 border border-white/10">
-                    <button onClick={() => { setActionMode('supply'); setInputAmount(''); setTxStep('idle'); }} className={`flex-1 py-2 text-xs font-mono uppercase transition-colors ${actionMode === 'supply' ? 'bg-[#D4FF00] text-black' : 'text-[#888888] hover:text-white'}`}>
+                    <button onClick={() => { setActionMode('supply'); setInputAmount(''); setTxStep('idle'); setSimulatedHF(null); }} className={`flex-1 py-2 text-xs font-mono uppercase transition-colors ${actionMode === 'supply' ? 'bg-[#D4FF00] text-black' : 'text-[#888888] hover:text-white'}`}>
                       {selection === 'UPETH_BORROW' ? 'Borrow' : 'Supply'}
                     </button>
-                    <button onClick={() => { setActionMode('withdraw'); setInputAmount(''); setTxStep('idle'); }} className={`flex-1 py-2 text-xs font-mono uppercase transition-colors ${actionMode === 'withdraw' ? 'bg-[#FF6B6B] text-black' : 'text-[#888888] hover:text-white'}`}>
+                    <button onClick={() => { setActionMode('withdraw'); setInputAmount(''); setTxStep('idle'); setSimulatedHF(null); }} className={`flex-1 py-2 text-xs font-mono uppercase transition-colors ${actionMode === 'withdraw' ? 'bg-[#FF6B6B] text-black' : 'text-[#888888] hover:text-white'}`}>
                       {selection === 'UPETH_BORROW' ? 'Repay' : 'Withdraw'}
                     </button>
                   </div>
@@ -1644,8 +1764,8 @@ export default function Dashboard() {
 
                   {/* Action Button */}
                   <div className="mt-8 space-y-3">
-                    <button onClick={handleButtonClick} disabled={isButtonDisabled()} className={`w-full py-5 font-bold font-mono uppercase tracking-widest text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${executionStatus === 'confirmed' ? 'bg-[#D4FF00] text-black' : actionMode === 'withdraw' ? 'bg-[#FF6B6B] text-black hover:bg-red-400' : simulatedHF !== null && simulatedHF < 1.0 ? 'bg-red-900 text-red-300 cursor-not-allowed' : 'bg-white text-black hover:bg-[#D4FF00]'}`}>
-                      {executionStatus === 'confirmed' ? 'CONFIRMED' : simulatedHF !== null && simulatedHF < 1.0 ? 'BLOCKED: HF TOO LOW' : getButtonText()}
+                    <button onClick={handleButtonClick} disabled={isButtonDisabled()} className={`w-full py-5 font-bold font-mono uppercase tracking-widest text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${executionStatus === 'confirmed' ? 'bg-[#D4FF00] text-black' : actionMode === 'withdraw' ? 'bg-[#FF6B6B] text-black hover:bg-red-400' : (actionMode === 'supply' && simulatedHF !== null && simulatedHF < 1.0) ? 'bg-red-900 text-red-300 cursor-not-allowed' : 'bg-white text-black hover:bg-[#D4FF00]'}`}>
+                      {executionStatus === 'confirmed' ? 'CONFIRMED' : (actionMode === 'supply' && simulatedHF !== null && simulatedHF < 1.0) ? 'BLOCKED: HF TOO LOW' : getButtonText()}
                     </button>
 
                     {selection === 'UPETH_BORROW' && actionMode === 'supply' && txStep !== 'idle' && (
