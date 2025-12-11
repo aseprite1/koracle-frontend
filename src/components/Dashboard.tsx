@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useAccount, useReadContract, useWriteContract, useWaitForTransactionReceipt, usePublicClient } from 'wagmi'
 import { formatUnits, parseUnits } from 'viem'
-import { ADDRESSES, MARKET_ID, morphoAbi, oracleAbi, erc20Abi, marketParams, liquidateAbi, faucetAbi } from '../config/contracts'
+import { ADDRESSES, MARKET_ID, morphoAbi, oracleAbi, erc20Abi, marketParams, faucetAbi } from '../config/contracts'
 import { giwaSepoliaNetwork } from '../config/appkit'
 
 // ============ TYPES ============
@@ -27,6 +27,9 @@ interface LiquidatablePosition {
   healthFactor: number
   maxSeizable: bigint
   liquidationIncentive: number
+  // Kimp liquidation fields
+  userKimpThreshold: number
+  canKimpLiquidate: boolean
 }
 
 // ============ CONSTANTS ============
@@ -100,6 +103,11 @@ export default function Dashboard() {
 
   // Faucet State
   const [faucetTxStep, setFaucetTxStep] = useState<'idle' | 'claiming' | 'claimed'>('idle')
+
+  // Kimp Threshold State
+  const [userKimpThreshold, setUserKimpThreshold] = useState<number>(0)
+  const [kimpThresholdInput, setKimpThresholdInput] = useState('')
+  const [kimpTxStep, setKimpTxStep] = useState<'idle' | 'setting'>('idle')
 
   // Error State (replaces alert())
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
@@ -185,6 +193,18 @@ export default function Dashboard() {
     query: { refetchInterval: 10000 },
   })
 
+  // User Kimp Threshold
+  const { data: userKimpThresholdData, refetch: refetchKimpThreshold } = useReadContract({
+    address: ADDRESSES.MORPHO,
+    abi: morphoAbi,
+    functionName: 'getUserKimpThreshold',
+    args: address ? [MARKET_ID, address] : undefined,
+    chainId: giwaSepoliaNetwork.id,
+    query: { refetchInterval: 10000 },
+  })
+
+
+
   // === Contract Writes ===
   const { writeContract, data: txHash, reset: resetWrite, error: writeError } = useWriteContract()
   const { isLoading: isTxPending, isSuccess: isTxSuccess, isError: isTxError } = useWaitForTransactionReceipt({
@@ -241,6 +261,13 @@ export default function Dashboard() {
       setKimchi(Number(formatUnits(kimchiPremium, 18)) * 100)
     }
   }, [kimchiPremium])
+
+  // Update user kimp threshold
+  useEffect(() => {
+    if (userKimpThresholdData) {
+      setUserKimpThreshold(Number(formatUnits(userKimpThresholdData as bigint, 18)) * 100)
+    }
+  }, [userKimpThresholdData])
 
   // TVL calculation: totalSupply (in UPETH) * ETH price in KRW
   useEffect(() => {
@@ -302,9 +329,16 @@ export default function Dashboard() {
             resetWrite()
           }, 1500)
         })
+      } else if (kimpTxStep === 'setting') {
+        // Kimp threshold set success
+        setKimpTxStep('idle')
+        showToast('Kimp threshold updated!')
+        setKimpThresholdInput('')
+        refetchKimpThreshold()
+        resetWrite()
       }
     }
-  }, [isTxSuccess, txStep, faucetTxStep, refetchPosition, refetchUpethBalance, refetchUpkrwBalance, refetchMarket, refetchHasClaimed, resetWrite, showToast])
+  }, [isTxSuccess, txStep, faucetTxStep, kimpTxStep, refetchPosition, refetchUpethBalance, refetchUpkrwBalance, refetchMarket, refetchHasClaimed, refetchKimpThreshold, resetWrite, showToast])
 
   useEffect(() => {
     if (positionData && marketData) {
@@ -362,6 +396,7 @@ export default function Dashboard() {
     if (!publicClient || !oraclePrice || !marketData || !borrowerAddress) return null
     
     try {
+      // Get position data
       const position = await publicClient.readContract({
         address: ADDRESSES.MORPHO,
         abi: morphoAbi,
@@ -390,6 +425,25 @@ export default function Dashboard() {
       // Max seizable collateral (in UPKRW)
       const maxSeizable = BigInt(collateral)
 
+      // Get kimp liquidation status
+      let userKimpThreshold = 0
+      let canKimpLiquidate = false
+      
+      try {
+        const liquidationStatus = await publicClient.readContract({
+          address: ADDRESSES.MORPHO,
+          abi: morphoAbi,
+          functionName: 'getLiquidationStatus',
+          args: [marketParams, borrowerAddress as `0x${string}`],
+        })
+        
+        // liquidationStatus: [isHealthy, currentKimp, userThreshold, canKimpLiquidate]
+        userKimpThreshold = Number(formatUnits(liquidationStatus[2] as bigint, 18)) * 100
+        canKimpLiquidate = liquidationStatus[3] as boolean
+      } catch (e) {
+        logError('Error getting liquidation status:', e)
+      }
+
       return {
         borrower: borrowerAddress as `0x${string}`,
         collateral: BigInt(collateral),
@@ -398,6 +452,8 @@ export default function Dashboard() {
         healthFactor,
         maxSeizable,
         liquidationIncentive,
+        userKimpThreshold,
+        canKimpLiquidate,
       }
     } catch (error) {
       logError('Error checking position:', error)
@@ -486,8 +542,8 @@ export default function Dashboard() {
     setLiquidateTxStep('liquidating')
     writeContract({
       address: ADDRESSES.MORPHO,
-      abi: [...morphoAbi, ...liquidateAbi],
-      functionName: 'liquidate',
+      abi: morphoAbi,
+      functionName: 'customLiquidate',
       args: [marketParams, selectedBorrower.borrower, seizeAmount, 0n, '0x' as `0x${string}`],
     })
   }
@@ -528,6 +584,59 @@ export default function Dashboard() {
       })
     }
   }, [isTxSuccess, liquidateTxStep, selectedBorrower, refetchUpethBalance, refetchUpkrwBalance, refetchPosition, refetchMarket, checkBorrowerPosition])
+
+  // === Kimp Threshold Functions ===
+  const setKimpThreshold = async () => {
+    if (!isConnected || !kimpThresholdInput || !address) return
+    
+    const thresholdPercent = parseFloat(kimpThresholdInput)
+    
+    // Validate: must be higher than current kimp
+    if (thresholdPercent <= kimchi) {
+      setErrorMessage(`김프 임계값은 현재 김프(${kimchi.toFixed(2)}%)보다 높아야 합니다`)
+      setTimeout(() => setErrorMessage(null), 4000)
+      return
+    }
+    
+    // Validate: min 1%, max 50%
+    if (thresholdPercent < 1 || thresholdPercent > 50) {
+      setErrorMessage('김프 임계값은 1% ~ 50% 사이여야 합니다')
+      setTimeout(() => setErrorMessage(null), 4000)
+      return
+    }
+    
+    const thresholdWei = parseUnits((thresholdPercent / 100).toString(), 18)
+    
+    setKimpTxStep('setting')
+    try {
+      writeContract({
+        address: ADDRESSES.MORPHO,
+        abi: morphoAbi,
+        functionName: 'setKimpThreshold',
+        args: [marketParams, thresholdWei],
+      })
+    } catch (error) {
+      logError('Set kimp threshold failed:', error)
+      setKimpTxStep('idle')
+    }
+  }
+
+  const clearKimpThreshold = async () => {
+    if (!isConnected || !address) return
+    
+    setKimpTxStep('setting')
+    try {
+      writeContract({
+        address: ADDRESSES.MORPHO,
+        abi: morphoAbi,
+        functionName: 'setKimpThreshold',
+        args: [marketParams, 0n],
+      })
+    } catch (error) {
+      logError('Clear kimp threshold failed:', error)
+      setKimpTxStep('idle')
+    }
+  }
 
   // === Computed Values ===
   const utilization = marketData && marketData[0] > 0n
@@ -1022,7 +1131,7 @@ export default function Dashboard() {
         {/* Navigation */}
         <nav className="h-16 border-b border-white/10 flex items-center justify-between px-6 z-40 bg-[#030303]/80 backdrop-blur-sm sticky top-0">
           <div className="flex items-baseline space-x-2">
-            <span className="font-serif italic text-2xl tracking-wide font-bold text-white">Coin Billigi</span>
+            <span className="font-serif italic text-2xl tracking-wide font-bold text-white">Coin Biligi</span>
             <span className="font-mono text-[10px] text-[#888888] tracking-widest uppercase">by koracle</span>
           </div>
 
@@ -1030,7 +1139,7 @@ export default function Dashboard() {
             <button onClick={() => navigate('dashboard')} className={`hover:text-[#D4FF00] transition-colors ${currentView === 'dashboard' ? 'text-white' : ''}`}>PROTOCOL</button>
             <button onClick={() => navigate('liquidate')} className={`hover:text-[#D4FF00] transition-colors ${currentView === 'liquidate' ? 'text-white' : ''}`}>LIQUIDATION <span className="text-[10px] text-[#FF6B6B] align-top ml-0.5">●</span></button>
             <button onClick={() => navigate('faucet')} className={`hover:text-[#D4FF00] transition-colors ${currentView === 'faucet' ? 'text-white' : ''}`}>FAUCET <span className="text-[10px] text-[#D4FF00] align-top ml-0.5">●</span></button>
-            <button onClick={() => showToast('Docs coming soon!')} className="hover:text-[#D4FF00] transition-colors">DOCS</button>
+            <a href="https://koracle.gitbook.io/koracle-docs/" target="_blank" rel="noopener noreferrer" className="hover:text-[#D4FF00] transition-colors">DOCS</a>
           </div>
 
           <div className="flex items-center space-x-4">
@@ -1158,6 +1267,70 @@ export default function Dashboard() {
                             <div className="text-xs text-[#888888] whitespace-nowrap">per ETH</div>
                           </div>
                         </div>
+
+                        {/* Kimp Threshold Setting - Only show if user has a borrow position */}
+                        {userPosition.borrowAssets > 0 && (
+                          <div className="lg:col-span-4 p-5 border border-[#D4FF00]/30 bg-[#D4FF00]/5">
+                            <div className="flex items-center justify-between mb-4">
+                              <div>
+                                <div className="font-mono text-[10px] uppercase text-[#D4FF00] mb-1">Kimp Liquidation Threshold</div>
+                                <p className="font-mono text-[10px] text-[#888888]">
+                                  김프가 설정값 이상이면 청산 가능 (현재 김프: {kimchi.toFixed(2)}%)
+                                </p>
+                              </div>
+                              {userKimpThreshold > 0 && (
+                                <div className="text-right">
+                                  <div className="font-mono text-xl text-[#D4FF00]">{userKimpThreshold.toFixed(1)}%</div>
+                                  <div className="font-mono text-[10px] text-[#888888]">현재 설정</div>
+                                </div>
+                              )}
+                            </div>
+                            
+                            <div className="flex gap-3">
+                              <div className="flex-1 relative">
+                                <input
+                                  type="text"
+                                  inputMode="decimal"
+                                  value={kimpThresholdInput}
+                                  onChange={(e) => {
+                                    const v = e.target.value
+                                    if (v === '' || /^\d*\.?\d*$/.test(v)) setKimpThresholdInput(v)
+                                  }}
+                                  placeholder={`${Math.max(kimchi + 0.5, 1).toFixed(1)}% 이상`}
+                                  className="w-full bg-transparent border border-white/20 px-4 py-2 font-mono text-sm text-white focus:outline-none focus:border-[#D4FF00] placeholder-white/30"
+                                />
+                                <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[#888888] text-sm">%</span>
+                              </div>
+                              <button
+                                onClick={setKimpThreshold}
+                                disabled={!kimpThresholdInput || kimpTxStep === 'setting' || isTxPending}
+                                className="px-4 py-2 bg-[#D4FF00] text-black font-mono text-xs font-bold uppercase hover:bg-[#c4ef00] disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                              >
+                                {kimpTxStep === 'setting' ? '...' : '설정'}
+                              </button>
+                              {userKimpThreshold > 0 && (
+                                <button
+                                  onClick={clearKimpThreshold}
+                                  disabled={kimpTxStep === 'setting' || isTxPending}
+                                  className="px-4 py-2 border border-[#FF6B6B] text-[#FF6B6B] font-mono text-xs font-bold uppercase hover:bg-[#FF6B6B]/10 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                                >
+                                  해제
+                                </button>
+                              )}
+                            </div>
+                            
+                            {userKimpThreshold > 0 && kimchi >= userKimpThreshold && (
+                              <div className="mt-3 p-2 border border-[#FF6B6B] bg-[#FF6B6B]/10">
+                                <div className="flex items-center space-x-2">
+                                  <span className="material-symbols-outlined text-[#FF6B6B] text-sm">warning</span>
+                                  <span className="font-mono text-xs text-[#FF6B6B]">
+                                    현재 김프({kimchi.toFixed(2)}%)가 임계값 이상입니다. 청산될 수 있습니다!
+                                  </span>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        )}
                       </section>
                     )}
 
@@ -1233,8 +1406,8 @@ export default function Dashboard() {
                         <div><div className="text-xs text-[#888888] uppercase tracking-wider mb-1">Audit Status</div><div className="text-sm font-mono text-white">Secured by Morpho Blue</div></div>
                       </div>
                       <div className="p-4 border border-white/5 bg-white/[0.01] flex items-center space-x-4">
-                        <span className="material-symbols-outlined text-[#888888]">public</span>
-                        <div><div className="text-xs text-[#888888] uppercase tracking-wider mb-1">Oracle</div><div className="text-sm font-mono text-white">Chainlink + KRW Aggregator</div></div>
+                        <span className="material-symbols-outlined text-[#D4FF00]">public</span>
+                        <div><div className="text-xs text-[#888888] uppercase tracking-wider mb-1">Oracle</div><div className="text-sm font-mono text-[#D4FF00]">Koracle (WEIGHTED.ETH.KRW)</div></div>
                       </div>
                       <div className="p-4 border border-white/5 bg-white/[0.01] flex items-center space-x-4">
                         <span className="material-symbols-outlined text-[#FF6B6B]">warning</span>
@@ -1296,20 +1469,23 @@ export default function Dashboard() {
                       ) : (
                         <div className="divide-y divide-white/5">
                           {/* Table Header */}
-                          <div className="grid grid-cols-[2fr_1fr_1fr_1fr_120px] gap-4 px-4 py-3 font-mono text-[10px] uppercase text-[#888888]">
+                          <div className="grid grid-cols-[2fr_1fr_1fr_1fr_1fr_120px] gap-4 px-4 py-3 font-mono text-[10px] uppercase text-[#888888]">
                             <span>Borrower</span>
                             <span className="text-right">Collateral</span>
                             <span className="text-right">Debt</span>
-                            <span className="text-right">Health Factor</span>
+                            <span className="text-right">HF</span>
+                            <span className="text-right">Kimp Threshold</span>
                             <span className="text-right">Action</span>
                           </div>
 
                           {/* Position Rows */}
-                          {liquidatablePositions.map((pos) => (
+                          {liquidatablePositions.map((pos) => {
+                            const canLiquidate = pos.healthFactor < 1 || pos.canKimpLiquidate
+                            return (
                             <div 
                               key={pos.borrower} 
-                              className={`grid grid-cols-[2fr_1fr_1fr_1fr_120px] gap-4 px-4 py-4 items-center transition-colors ${
-                                pos.healthFactor < 1 ? 'bg-red-500/10' : pos.healthFactor < 1.1 ? 'bg-orange-500/10' : ''
+                              className={`grid grid-cols-[2fr_1fr_1fr_1fr_1fr_120px] gap-4 px-4 py-4 items-center transition-colors ${
+                                canLiquidate ? 'bg-red-500/10' : pos.healthFactor < 1.1 ? 'bg-orange-500/10' : ''
                               }`}
                             >
                               <div className="font-mono text-sm text-white truncate">
@@ -1329,19 +1505,29 @@ export default function Dashboard() {
                                 {pos.healthFactor.toFixed(2)}
                               </div>
                               <div className="text-right">
-                                {pos.healthFactor < 1 ? (
+                                {pos.userKimpThreshold > 0 ? (
+                                  <div className={`font-mono text-sm ${pos.canKimpLiquidate ? 'text-[#FF6B6B]' : 'text-[#D4FF00]'}`}>
+                                    {pos.userKimpThreshold.toFixed(1)}%
+                                    {pos.canKimpLiquidate && <span className="text-[10px] ml-1">(!)</span>}
+                                  </div>
+                                ) : (
+                                  <span className="font-mono text-xs text-[#888888]">-</span>
+                                )}
+                              </div>
+                              <div className="text-right">
+                                {canLiquidate ? (
                                   <button
                                     onClick={() => setSelectedBorrower(pos)}
                                     className="px-3 py-1.5 bg-[#FF6B6B] text-white font-mono text-xs font-bold uppercase hover:bg-red-400 transition-colors"
                                   >
-                                    Liquidate
+                                    {pos.canKimpLiquidate && pos.healthFactor >= 1 ? 'Kimp Liq' : 'Liquidate'}
                                   </button>
                                 ) : (
                                   <span className="font-mono text-xs text-[#888888]">Healthy</span>
                                 )}
                               </div>
                             </div>
-                          ))}
+                          )})}
                         </div>
                       )}
                     </div>
@@ -1359,7 +1545,7 @@ export default function Dashboard() {
                           </button>
                         </div>
 
-                        <div className="grid grid-cols-3 gap-4 mb-6">
+                        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
                           <div className="p-3 bg-black/20 border border-white/10">
                             <div className="font-mono text-[10px] uppercase text-[#888888] mb-1">Collateral</div>
                             <div className="font-mono text-lg text-white">{fmtCompact(Number(selectedBorrower.collateral) / 1e18)}</div>
@@ -1372,8 +1558,30 @@ export default function Dashboard() {
                           </div>
                           <div className="p-3 bg-black/20 border border-white/10">
                             <div className="font-mono text-[10px] uppercase text-[#888888] mb-1">Health Factor</div>
-                            <div className="font-mono text-lg text-red-500">{selectedBorrower.healthFactor.toFixed(4)}</div>
-                            <div className="font-mono text-xs text-[#FF6B6B]">Liquidatable!</div>
+                            <div className={`font-mono text-lg ${selectedBorrower.healthFactor < 1 ? 'text-red-500' : 'text-green-400'}`}>
+                              {selectedBorrower.healthFactor.toFixed(4)}
+                            </div>
+                            <div className={`font-mono text-xs ${selectedBorrower.healthFactor < 1 ? 'text-[#FF6B6B]' : 'text-[#888888]'}`}>
+                              {selectedBorrower.healthFactor < 1 ? 'HF Liquidatable!' : 'HF Safe'}
+                            </div>
+                          </div>
+                          <div className="p-3 bg-black/20 border border-white/10">
+                            <div className="font-mono text-[10px] uppercase text-[#888888] mb-1">Kimp Threshold</div>
+                            {selectedBorrower.userKimpThreshold > 0 ? (
+                              <>
+                                <div className={`font-mono text-lg ${selectedBorrower.canKimpLiquidate ? 'text-[#FF6B6B]' : 'text-[#D4FF00]'}`}>
+                                  {selectedBorrower.userKimpThreshold.toFixed(1)}%
+                                </div>
+                                <div className={`font-mono text-xs ${selectedBorrower.canKimpLiquidate ? 'text-[#FF6B6B]' : 'text-[#888888]'}`}>
+                                  {selectedBorrower.canKimpLiquidate ? 'Kimp Liquidatable!' : `Current: ${kimchi.toFixed(1)}%`}
+                                </div>
+                              </>
+                            ) : (
+                              <>
+                                <div className="font-mono text-lg text-[#888888]">-</div>
+                                <div className="font-mono text-xs text-[#888888]">Not set</div>
+                              </>
+                            )}
                           </div>
                         </div>
 
@@ -1458,18 +1666,20 @@ export default function Dashboard() {
                           <div>
                             <div className="font-mono text-sm text-white mb-1">How Liquidation Works</div>
                             <p className="font-mono text-xs text-[#888888] leading-relaxed">
-                              When Health Factor drops below 1.0, anyone can repay part of the borrower's debt and seize their collateral at a 5% discount.
+                              <strong>1. Health Factor 청산:</strong> HF가 1.0 미만이면 누구나 청산 가능<br/>
+                              <strong>2. Kimp 청산:</strong> 차용자가 설정한 김프 임계값 도달 시 청산 가능
                             </p>
                           </div>
                         </div>
                       </div>
-                      <div className="p-4 border border-white/10 bg-white/[0.02]">
+                      <div className="p-4 border border-[#D4FF00]/30 bg-[#D4FF00]/5">
                         <div className="flex items-start space-x-3">
-                          <span className="material-symbols-outlined text-[#FF6B6B]">warning</span>
+                          <span className="material-symbols-outlined text-[#D4FF00]">trending_up</span>
                           <div>
-                            <div className="font-mono text-sm text-white mb-1">Kimchi Premium Risk</div>
+                            <div className="font-mono text-sm text-white mb-1">Kimp Liquidation</div>
                             <p className="font-mono text-xs text-[#888888] leading-relaxed">
-                              High kimchi premium ({kimchi.toFixed(1)}%) increases liquidation risk as oracle price may move against borrowers.
+                              현재 김프: <span className={kimchi > 3 ? 'text-[#FF6B6B]' : 'text-[#D4FF00]'}>{kimchi.toFixed(2)}%</span><br/>
+                              차용자가 김프 임계값을 설정했다면, 해당 값 도달 시 청산 가능
                             </p>
                           </div>
                         </div>
@@ -1506,7 +1716,7 @@ export default function Dashboard() {
                         <div className="grid grid-cols-2 gap-4 mb-8">
                           <div className="p-4 border border-white/10 bg-white/[0.02] text-center">
                             <div className="flex items-center justify-center space-x-2 mb-2">
-                              <svg className="w-6 h-6" viewBox="0 0 32 32"><g fill="none" fillRule="evenodd"><circle cx="16" cy="16" r="16" fill="#627EEA"/><path fill="#FFF" fillOpacity=".602" d="M16.498 4v8.87l7.497 3.35z"/><path fill="#FFF" d="M16.498 4L9 16.22l7.498-3.35z"/></g></svg>
+                              <svg className="w-6 h-6" viewBox="0 0 32 32"><g fill="none" fillRule="evenodd"><circle cx="16" cy="16" r="16" fill="#627EEA"/><path fill="#FFF" fillOpacity=".602" d="M16.498 4v8.87l7.497 3.35z"/><path fill="#FFF" d="M16.498 4L9 16.22l7.498-3.35z"/><path fill="#FFF" fillOpacity=".602" d="M16.498 21.968l7.497-4.353-7.497-3.348z"/><path fill="#FFF" d="M9 17.615l7.498 4.353v-7.701z"/><path fill="#FFF" fillOpacity=".2" d="M16.498 20.573l7.497-4.353-7.497 10.291z"/><path fill="#FFF" fillOpacity=".602" d="M9 16.22l7.498 4.353v1.791z"/></g></svg>
                               <span className="font-mono text-sm text-[#888888]">UPETH</span>
                             </div>
                             <div className="font-mono text-2xl text-[#D4FF00]">10</div>
@@ -1584,6 +1794,34 @@ export default function Dashboard() {
                               These tokens have no real value and are for testing purposes only on GIWA Sepolia testnet.
                             </p>
                           </div>
+                        </div>
+                      </div>
+
+                      {/* GIWA ETH Faucet */}
+                      <div className="mt-6 p-6 border border-white/10 bg-gradient-to-br from-white/[0.02] to-white/[0.05] relative overflow-hidden">
+                        <div className="absolute top-0 right-0 w-32 h-32 bg-[#627EEA]/10 rounded-full blur-3xl -mr-16 -mt-16" />
+                        <div className="relative">
+                          <div className="flex items-center space-x-3 mb-4">
+                            <div className="w-10 h-10 rounded-full bg-[#627EEA]/20 flex items-center justify-center">
+                              <svg className="w-6 h-6" viewBox="0 0 32 32"><g fill="none" fillRule="evenodd"><circle cx="16" cy="16" r="16" fill="#627EEA"/><path fill="#FFF" fillOpacity=".602" d="M16.498 4v8.87l7.497 3.35z"/><path fill="#FFF" d="M16.498 4L9 16.22l7.498-3.35z"/><path fill="#FFF" fillOpacity=".602" d="M16.498 21.968l7.497-4.353-7.497-3.348z"/><path fill="#FFF" d="M9 17.615l7.498 4.353v-7.701z"/><path fill="#FFF" fillOpacity=".2" d="M16.498 20.573l7.497-4.353-7.497 10.291z"/><path fill="#FFF" fillOpacity=".602" d="M9 16.22l7.498 4.353v1.791z"/></g></svg>
+                            </div>
+                            <div>
+                              <div className="font-mono text-sm text-white font-bold">Need Gas?</div>
+                              <div className="font-mono text-[10px] text-[#888888] uppercase tracking-wider">GIWA Sepolia Faucet</div>
+                            </div>
+                          </div>
+                          <p className="font-mono text-xs text-[#888888] leading-relaxed mb-4">
+                            Get free testnet ETH for gas fees on GIWA Sepolia. Claim up to <span className="text-white">0.005 ETH</span> every 24 hours.
+                          </p>
+                          <a
+                            href="https://faucet.giwa.io/"
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="flex items-center justify-center space-x-2 w-full py-3 border border-[#627EEA] text-[#627EEA] font-mono text-sm font-bold uppercase tracking-wider hover:bg-[#627EEA]/10 transition-colors"
+                          >
+                            <span>Get GIWA ETH</span>
+                            <span className="material-symbols-outlined text-sm">open_in_new</span>
+                          </a>
                         </div>
                       </div>
                     </div>
